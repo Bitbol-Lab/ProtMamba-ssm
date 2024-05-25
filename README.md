@@ -57,7 +57,8 @@ performance.
 
 ### Model weights
 
-The model weights are available in
+The model weights are available in the latest release of the repository
+[here](https://github.com/Bitbol-Lab/ProtMamba-ssm/releases/tag/v1.0)
 
 ## Install Repository
 

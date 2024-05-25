@@ -1,0 +1,42 @@
+data_dir: ""
+output_dir: "results/"
+namedir: "test0"
+train_dataset_path: "encoded_MSAs_train.pkl"
+eval_dataset_path: '...'
+batch_size: 4 # mamba trained with total 0.5M tokens per batch
+d_model: 1024
+gradient_accumulation_steps: 8
+checkpoint_mixer: True
+learning_rate: 0.0006 # mamba default (x5), decrease to 0.0006 for sizes > 100M params and 0.0002 for sizes > 1B params
+weight_decay: 0.1 # mamba default
+beta1: 0.9 # mamba default
+beta2: 0.95 # mamba default
+max_grad_norm: 1. # mamba default
+warmup_steps: 500 # change accordingly to the number of epochs (500)
+scheduler: "constant" # "cosine" # "cosine-restarts" # "constant"
+num_cycles: 1
+n_layer: 16
+num_epochs: 100
+residual_in_fp32: False
+vocab_size: 38
+sample_sequences: False # set to false to have all sequences in the batch to be of the same length given by max_msa_len
+max_msa_len: 131072 #32768 #65536 #131072 #262144 #524288 #1048576
+seed_sequence_sampling: 42
+seed_datasets: 0
+save_steps: 250
+eval_steps: 50
+size_validation: 192
+logging_steps: 10
+eval_accumulation_steps: 200
+save_total_limit: 50
+dtype: "bfloat16"
+fim_strategy: "multiple_span" #["no-scramble", "one_span", "multiple_span"]
+compute_only_fim_loss: False
+always_mask: False
+max_position_embeddings: 2048
+max_seq_position_embeddings: 512
+add_position_ids: "1d" #["none, "1d", "2d"]
+reverse: False # when true trains the model in a bidirectional way
+early_stopping_metric: "eval_train_loss" # Name of metric to use for early stopping
+patience: 10 # how many evaluations to wait before restarting training before a spike
+loss_increase_factor: 1.005 # how much the loss can increase (for patience iterations) before restarting training

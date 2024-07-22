@@ -45,7 +45,7 @@ regions of sequences, and predicting the fitness of protein variants.
 
 `configs/`: Configuration files for model training and evaluation.
 
-`data/`: Example dataset.
+`data/`: Example dataset. Split between training and testing used in the original training of the model
 
 `nbs/`: Implementation of the ProtMamba model architecture in jupyter
 notebooks.

@@ -16,11 +16,15 @@ from dataclasses import field, dataclass
 from functools import partial
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+from mamba_ssm.modules.block import Block
+from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 from mamba_ssm.models.mixer_seq_simple import _init_weights, MixerModel
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 from mamba_ssm.utils.generation import *
 from transformers import PretrainedConfig
+from torch.utils.checkpoint import checkpoint
+from mamba_ssm.modules.mamba_simple import Mamba
+
 
 @dataclass
 class MambaConfig(PretrainedConfig):
@@ -73,23 +77,23 @@ def sample_safe(logits, top_k=1, top_p=0.0, min_p=0.0, temperature=1.0):
 
 @torch.inference_mode()
 def decode_safe(
-    input_ids,
-    position_ids,
-    seq_position_ids,
-    is_fim,
-    model,
-    max_length,
-    top_k=1,
-    top_p=0.0,
-    min_p=0.0,
-    temperature=1.0,
-    repetition_penalty=1.0,
-    eos_token_id=None,
-    teacher_outputs=None,
-    vocab_size=None,
-    cg=False,
-    enable_timing=False,
-    streamer: Optional[TextStreamer] = None
+        input_ids,
+        position_ids,
+        seq_position_ids,
+        is_fim,
+        model,
+        max_length,
+        top_k=1,
+        top_p=0.0,
+        min_p=0.0,
+        temperature=1.0,
+        repetition_penalty=1.0,
+        eos_token_id=None,
+        teacher_outputs=None,
+        vocab_size=None,
+        cg=False,
+        enable_timing=False,
+        streamer: Optional[TextStreamer] = None
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -152,15 +156,21 @@ def decode_safe(
         return token.unsqueeze(1)
 
     def get_fim_position_id(last_position_ids, sampled_tokens, is_fim, repeat_next=False):
-        val = int(last_position_ids) + 1 
-        should_repeat_next = False
-        if is_fim and int(sampled_tokens) in is_fim:
-            val = is_fim[int(sampled_tokens)]
-            should_repeat_next = True
-        elif repeat_next:
-            val = int(last_position_ids)
-        return torch.full_like(last_position_ids, fill_value=val), should_repeat_next
-    
+        if type(is_fim) is dict:
+            val = int(last_position_ids) + 1
+            should_repeat_next = False
+            if is_fim and int(sampled_tokens) in is_fim:
+                val = is_fim[int(sampled_tokens)]
+                should_repeat_next = True
+            elif repeat_next:
+                val = int(last_position_ids)
+            return torch.full_like(last_position_ids, fill_value=val), should_repeat_next
+        else:
+            t = [get_fim_position_id(last_position_ids_, sampled_tokens_, is_fim_dict, repeat_next) for
+                 (last_position_ids_, sampled_tokens_, is_fim_dict) in
+                 zip(last_position_ids, sampled_tokens, is_fim)]
+            return torch.stack([t_[0] for t_ in t], dim=0), t[0][1]
+
     def should_stop(current_token, inference_params):
         if inference_params.seqlen_offset == 0:
             return False
@@ -181,8 +191,6 @@ def decode_safe(
     new_position_ids, new_seq_position_ids = [position_ids], [seq_position_ids]
     sequences_cat = input_ids
     repeat_next = False
-    if position_ids.shape[0]>1:
-        raise NotImplementedError("Batched generation with position_ids not supported")
     while not should_stop(sequences[-1], inference_params):
         scores.append(get_logits(sequences[-1], new_position_ids[-1], new_seq_position_ids[-1], inference_params))
         inference_params.seqlen_offset += sequences[-1].shape[1]
@@ -197,11 +205,12 @@ def decode_safe(
         sequences.append(sampled_tokens)
         # Update position_ids
         if position_ids is not None:
-            last_position_ids, repeat_next = get_fim_position_id(new_position_ids[-1][:,-1:], sampled_tokens, is_fim, repeat_next)
+            last_position_ids, repeat_next = get_fim_position_id(new_position_ids[-1][:, -1:], sampled_tokens, is_fim,
+                                                                 repeat_next)
             new_position_ids.append(last_position_ids)
         # Update seq_position_ids
         if seq_position_ids is not None:
-            new_seq_position_ids.append(new_seq_position_ids[-1][:,-1:])
+            new_seq_position_ids.append(new_seq_position_ids[-1][:, -1:])
 
         if streamer is not None:
             streamer.put(sampled_tokens.cpu())
@@ -237,11 +246,6 @@ class GenerationMixinSafe(GenerationMixin):
         if not output_scores:
             output.scores = None
         return output if return_dict_in_generate else output.sequences
-
-# %% ../nbs/01_modules.ipynb 5
-from torch.utils.checkpoint import checkpoint
-from mamba_ssm.modules.mamba_simple import Mamba, Block
-
 
 class CheckpointedModule(torch.nn.Module):
     def __init__(self, layer):
@@ -280,6 +284,7 @@ def create_block(
     block = Block(
         d_model,
         mixer_cls,
+        mlp_cls=nn.Identity,
         norm_cls=norm_cls,
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
@@ -289,7 +294,7 @@ def create_block(
         block.mixer = CheckpointedModule(block.mixer)
     return block
 
-# %% ../nbs/01_modules.ipynb 7
+
 class MixerModelSafe(MixerModel):
     """
         Overwrite the forward method to allow saving intermediate layers.
@@ -512,6 +517,8 @@ class MixerModelWithPosids(nn.Module):
         residual = None
         if len(save_layer) > 0:
             hidden_states_dict = {}
+        if 0 in save_layer:
+            hidden_states_dict[0] = hidden_states.detach().cpu().to(torch.float).numpy()
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params
@@ -707,7 +714,7 @@ class MambaLMHeadModelwithPosids(nn.Module, GenerationMixinSafe):
         """
         return self.protected_forward(input_ids, position_ids, inference_params, num_last_tokens, save_layer)
 
-    def protected_forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, save_layer=[]):
+    def protected_forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, save_layer=[], ):
         hidden_states = self.backbone(input_ids, position_ids=position_ids, inference_params=inference_params, save_layer=save_layer)
         if len(save_layer) > 0:
             return hidden_states
@@ -715,8 +722,10 @@ class MambaLMHeadModelwithPosids(nn.Module, GenerationMixinSafe):
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
-        CausalLMOutput = namedtuple("CausalLMOutput", ["loss", "logits"])
-        return CausalLMOutput(loss=None, logits=lm_logits)
+        CausalLMOutput = namedtuple("CausalLMOutput", ["loss", "logits", "hidden_states"])
+        if len(save_layer) > 0:
+            return CausalLMOutput(loss=None, logits=lm_logits, hidden_states=hidden_states)
+        return CausalLMOutput(loss=None, logits=lm_logits, hidden_states=None)
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, checkpoint_mixer=False, **kwargs):

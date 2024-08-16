@@ -3,6 +3,8 @@
 # %% auto 0
 __all__ = ['run']
 
+import os
+
 # %% ../nbs/00_core.ipynb 3
 # use_one_gpu = input("Do you want to use just one gpu? If yes, type the number of the gpu. If no, type -1.\n")
 # import os

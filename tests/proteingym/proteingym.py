@@ -1,5 +1,7 @@
 import os
 import sys
+from copy import deepcopy
+
 from sklearn.metrics import roc_auc_score, matthews_corrcoef
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -13,16 +15,73 @@ from mamba_ssm.utils.generation import *
 from tqdm import tqdm
 
 from ProtMamba_ssm import MambaLMHeadModelwithPosids, load_model, load_from_file, tokenizer, \
-    prepare_target, prepare_tokens, generate_sequence, AA_TO_ID
-from utils import MSASampler, Uniclust30_Dataset
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ['TORCH_USE_CUDA_DSA'] = "0"
+    prepare_tokens, generate_sequence, AA_TO_ID
+from tests.utils import MSASampler, Uniclust30_Dataset, prepare_target
 
 _checkpoints = {"protmamba_foundation": "/nvme1/common/mamba_100M_FIM_checkpoint_32k-100000",
                 "protmamba_finetuned": "/nvme1/common/mamba_100M_FIM_finetuned_32k_checkpoint-17000",
 
                 }
+
+val_names = ['A4_HUMAN_Seuma_2022',
+ 'AMFR_HUMAN_Tsuboyama_2023_4G3O',
+ 'BBC1_YEAST_Tsuboyama_2023_1TG0',
+ 'BCHB_CHLTE_Tsuboyama_2023_2KRU',
+ 'CATR_CHLRE_Tsuboyama_2023_2AMI',
+ 'CBPA2_HUMAN_Tsuboyama_2023_1O6X',
+ 'CBX4_HUMAN_Tsuboyama_2023_2K28',
+ 'CSN4_MOUSE_Tsuboyama_2023_1UFM',
+ 'CUE1_YEAST_Tsuboyama_2023_2MYX',
+ 'D7PM05_CLYGR_Somermeyer_2022',
+ 'DLG4_HUMAN_Faure_2021',
+ 'DNJA1_HUMAN_Tsuboyama_2023_2LO1',
+ 'DOCK1_MOUSE_Tsuboyama_2023_2M0Y',
+ 'EPHB2_HUMAN_Tsuboyama_2023_1F0M',
+ 'F7YBW7_MESOW_Ding_2023',
+ 'F7YBW8_MESOW_Aakre_2015',
+ 'FECA_ECOLI_Tsuboyama_2023_2D1U',
+ 'GCN4_YEAST_Staller_2018',
+ 'HECD1_HUMAN_Tsuboyama_2023_3DKM',
+ 'ISDH_STAAW_Tsuboyama_2023_2LHR',
+ 'MAFG_MOUSE_Tsuboyama_2023_1K1V',
+ 'MBD11_ARATH_Tsuboyama_2023_6ACV',
+ 'MYO3_YEAST_Tsuboyama_2023_2BTT',
+ 'NKX31_HUMAN_Tsuboyama_2023_2L9R',
+ 'NUSA_ECOLI_Tsuboyama_2023_1WCL',
+ 'NUSG_MYCTU_Tsuboyama_2023_2MI6',
+ 'OBSCN_HUMAN_Tsuboyama_2023_1V1C',
+ 'ODP2_GEOSE_Tsuboyama_2023_1W4G',
+ 'PIN1_HUMAN_Tsuboyama_2023_1I6C',
+ 'PITX2_HUMAN_Tsuboyama_2023_2L7M',
+ 'POLG_PESV_Tsuboyama_2023_2MXD',
+ 'PR40A_HUMAN_Tsuboyama_2023_1UZC',
+ 'PSAE_SYNP2_Tsuboyama_2023_1PSE',
+ 'RAD_ANTMA_Tsuboyama_2023_2CJJ',
+ 'RASK_HUMAN_Weng_2022_abundance',
+ 'RASK_HUMAN_Weng_2022_binding-DARPin_K55',
+ 'RBP1_HUMAN_Tsuboyama_2023_2KWH',
+ 'RCD1_ARATH_Tsuboyama_2023_5OAO',
+ 'RCRO_LAMBD_Tsuboyama_2023_1ORC',
+ 'RD23A_HUMAN_Tsuboyama_2023_1IFY',
+ 'RFAH_ECOLI_Tsuboyama_2023_2LCL',
+ 'RL20_AQUAE_Tsuboyama_2023_1GYZ',
+ 'RPC1_BP434_Tsuboyama_2023_1R69',
+ 'SAV1_MOUSE_Tsuboyama_2023_2YSB',
+ 'SDA_BACSU_Tsuboyama_2023_1PV0',
+ 'SPA_STAAU_Tsuboyama_2023_1LP1',
+ 'SPG2_STRSG_Tsuboyama_2023_5UBS',
+ 'SPTN1_CHICK_Tsuboyama_2023_1TUD',
+ 'SR43C_ARATH_Tsuboyama_2023_2N88',
+ 'SRBS1_HUMAN_Tsuboyama_2023_2O2W',
+ 'TCRG1_MOUSE_Tsuboyama_2023_1E0L',
+ 'THO1_YEAST_Tsuboyama_2023_2WQG',
+ 'TNKS2_HUMAN_Tsuboyama_2023_5JRT',
+ 'UBE4B_HUMAN_Tsuboyama_2023_3L1X',
+ 'UBR5_HUMAN_Tsuboyama_2023_1I2T',
+ 'VILI_CHICK_Tsuboyama_2023_1YU5',
+ 'YAIA_ECOLI_Tsuboyama_2023_2KVT',
+ 'YAP1_HUMAN_Araya_2012',
+ 'YNZC_BACSU_Tsuboyama_2023_2JVD']
 
 val_names = ['CBS_HUMAN_Sun_2020',
              'R1AB_SARS2_Flynn_2022',
@@ -44,6 +103,8 @@ val_names = ['CBS_HUMAN_Sun_2020',
              'A0A2Z5U3Z0_9INFA_Wu_2014',
              'TRPC_SACS2_Chan_2017',
              'S22A1_HUMAN_Yee_2023_abundance']
+
+#val_names = ["BLAT_ECOLX_Jacquier_2013",]
 
 def single_mutational_landscape(model, msa, num_sequences=50, mutated_pos=None, batch_size=64, ):
     """Generate the mutational landscape of a single protein sequence.
@@ -69,16 +130,11 @@ def single_mutational_landscape(model, msa, num_sequences=50, mutated_pos=None, 
         batch_mut_effects = []
         batch_logits = []
         for j in range(i, min(i + batch_size, sequence_length)):
-            if j not in mutated_pos:
+            if (mutated_pos is not None) and (j not in mutated_pos):
                 batch_mut_effects.append(torch.zeros(20).cpu())
                 continue
             gt = target_full[0, j + 1].int().item()
             use_fim = {"<mask-1>": ((j + 1, j + 2), 1)}
-            """if sequence_length > 1500:
-                target = tokenizer([target_sequence[0][max(0,j-750):j+750]], concatenate=True)
-                tokens = tokenizer([seq[max(0,j-750):j+750] for seq in context_msa], concatenate=True)
-                if j>750:
-                    use_fim = {f"<mask-1>": ((750, 751), 1)}"""
             input_seq, targ_pos, is_fim_dict = prepare_target(target, use_fim=use_fim)
             context_tokens, context_pos_ids = prepare_tokens(tokens,
                                                              target_tokens=input_seq,
@@ -88,7 +144,8 @@ def single_mutational_landscape(model, msa, num_sequences=50, mutated_pos=None, 
                                                              fim_strategy="multiple_span",
                                                              mask_fraction=0,
                                                              max_patches=0,
-                                                             add_position_ids="1d")
+                                                             add_position_ids="1d",
+                                                             shuffle=False)
 
             output = generate_sequence(model,
                                        context_tokens,
@@ -103,9 +160,8 @@ def single_mutational_landscape(model, msa, num_sequences=50, mutated_pos=None, 
                                        eos_token_id=AA_TO_ID["<cls>"],
                                        device="cuda")
             logits = torch.tensor(output["scores"])
-            logits_mut = logits[0, 0].log_softmax(-1)
-            mut_effect = logits_mut - logits_mut[gt]
-            mut_effect = mut_effect[4:24]
+            logits_mut = logits[0, 0, 4:24].log_softmax(-1)
+            mut_effect = logits_mut - logits_mut[gt-4]
             batch_mut_effects.append(torch.tensor(mut_effect).cpu())
             batch_logits.append(torch.tensor(logits_mut).cpu())
         all_mut_effects.extend(batch_mut_effects)
@@ -125,6 +181,98 @@ def multiple_mutational_landscape_iid(landscape, mutation_dict):
             for j in range(n_mut):
                 mut_effect[i] += landscape[muts[j][0], AA_TO_ID[muts[j][1]] - 4]
         all_mut_effects[n_mut] = mut_effect.cpu()
+
+    return torch.cat([torch.tensor(all_mut_effects[n_mut]) for n_mut in all_mut_effects.keys()], 0).cpu()
+
+
+def multiple_mutational_landscape(model, msa, mutation_dict, num_sequences=50, batch_size=16, ):
+    target_sequence = msa[:1]
+    context_msa = msa[1:][::-1]
+
+    torch.cuda.empty_cache()
+    # Tokenize the sequences and concatenate them into a single array
+    target = tokenizer(target_sequence, concatenate=True)
+    tokens = tokenizer(context_msa, concatenate=True)
+    all_mut_effects = {}
+    for n_mut, mutation_list in mutation_dict.items():
+        all_mut_effects[n_mut] = []
+        for k in tqdm(range(0, len(mutation_list), batch_size)):
+            context_tokens = []
+            context_pos_ids = []
+            teacher_outputs = []
+            teacher_outputs_gt = []
+            is_fim_dict = []
+            for i in range(k, min(k + batch_size, len(mutation_list))):
+                muts = mutation_list[i]
+                # sort by first element
+                muts = sorted(muts, key=lambda x: x[0])
+                use_fim = {f"<mask-{j + 1}>": ((muts[j][0] + 1, muts[j][0] + 2), 1) for j in range(len(muts))}
+                input_seq, targ_pos, is_fim_dict_ = prepare_target(target, use_fim=use_fim)
+                context_tokens_, context_pos_ids_ = prepare_tokens(tokens,
+                                                                   target_tokens=input_seq,
+                                                                   target_pos_ids=targ_pos,
+                                                                   DatasetClass=Uniclust30_Dataset,
+                                                                   num_sequences=num_sequences,
+                                                                   fim_strategy="multiple_span",
+                                                                   mask_fraction=0,
+                                                                   max_patches=0,
+                                                                   add_position_ids="1d",
+                                                                   shuffle=False)
+                teacher_outputs_ = [AA_TO_ID[muts[0][1]]]
+                teacher_outputs_gt_ = [target[0][muts[0][0] + 1]]
+                for j in range(1, len(muts)):
+                    teacher_outputs_.append(33 + j)
+                    teacher_outputs_gt_.append(33 + j)
+                    teacher_outputs_.append(AA_TO_ID[muts[j][1]])
+                    teacher_outputs_gt_.append(target[0][muts[j][0] + 1])
+                teacher_outputs_ = torch.LongTensor(teacher_outputs_).unsqueeze(0)
+                teacher_outputs_gt_ = torch.LongTensor(teacher_outputs_gt_).unsqueeze(0)
+                teacher_outputs_ = torch.cat([context_tokens_, teacher_outputs_], 1)
+                teacher_outputs_gt_ = torch.cat([context_tokens_, teacher_outputs_gt_], 1)
+                is_fim_dict.append(is_fim_dict_)
+                context_tokens.append(context_tokens_)
+                context_pos_ids.append(context_pos_ids_)
+                teacher_outputs.append(teacher_outputs_)
+                teacher_outputs_gt.append(teacher_outputs_gt_)
+            context_tokens = torch.cat(context_tokens, 0)
+            context_pos_ids = torch.cat(context_pos_ids, 0)
+            teacher_outputs = torch.cat(teacher_outputs, 0)
+            teacher_outputs_gt = torch.cat(teacher_outputs_gt, 0)
+            output = generate_sequence(model,
+                                       context_tokens,
+                                       position_ids=context_pos_ids,
+                                       is_fim=is_fim_dict,
+                                       max_length=teacher_outputs.size(1),
+                                       temperature=1.,
+                                       top_k=3,
+                                       top_p=0.0,
+                                       return_dict_in_generate=True,
+                                       output_scores=True,
+                                       teacher_outputs=teacher_outputs,
+                                       eos_token_id=AA_TO_ID["<cls>"],
+                                       device="cuda")
+            output_gt = generate_sequence(model,
+                                          context_tokens,
+                                          position_ids=context_pos_ids,
+                                          is_fim=is_fim_dict,
+                                          max_length=teacher_outputs_gt.size(1),
+                                          temperature=1.,
+                                          top_k=3,
+                                          top_p=0.0,
+                                          return_dict_in_generate=True,
+                                          output_scores=True,
+                                          teacher_outputs=teacher_outputs_gt,
+                                          eos_token_id=AA_TO_ID["<cls>"],
+                                          device="cuda")
+
+            for i in range(context_tokens.size(0)):
+                idx = 2 * torch.arange(n_mut)
+                logits = torch.tensor(output["scores"])[:,:, 4:24].log_softmax(-1)[
+                    i, idx, teacher_outputs[i, context_tokens.size(1) + idx]-4]
+                logits_gt = torch.tensor(output_gt["scores"])[:,:, 4:24].log_softmax(-1)[
+                    i, idx, teacher_outputs_gt[i, context_tokens.size(1) + idx]-4]
+                mut_effect = logits.sum().cpu().item() - logits_gt.sum().cpu().item()
+                all_mut_effects[n_mut].append(mut_effect)
 
     return torch.cat([torch.tensor(all_mut_effects[n_mut]) for n_mut in all_mut_effects.keys()], 0).cpu()
 
@@ -178,6 +326,58 @@ def ensemble_landscapes(folders,
 
         torch.save(res, f"{save_path}/spearman.pt")
 
+def export_to_csv(database_df, save_path, landscape_path,):
+    r"""Export the landscapes to CSV
+
+    Args:
+        database_df (pd.DataFrame): dataframe containing the database
+        save_path (str): path to save the CSV
+        landscape_path (str): path to the landscapes
+        validation_only (bool): whether to evaluate only the validation set
+    """
+    run_name = landscape_path.split("/")[-1]
+    save_path = f"{save_path}/{run_name}"
+    if not os.path.exists(f"{save_path}"):
+        os.mkdir(f"{save_path}")
+    for i, row in database_df.iterrows():
+        name = row["DMS_id"]
+        csv_filename = row["DMS_filename"]
+        df = pd.read_csv(csv_folder + csv_filename)
+        track_name_single = []
+        ordonater = []
+        track_name_multiple = {}
+        for i, row in df.iterrows():
+            muts = row["mutant"].split(":")
+            n_mut = len(muts)
+            if len(muts) == 1:
+                track_name_single.append(row["mutant"])
+                aa, pos = row["mutant"][-1], int(row["mutant"][1:-1])
+                idaa = AA_TO_ID[aa]
+                ordonater.append(pos * 20 + idaa)
+            else:
+                if n_mut not in track_name_multiple:
+                    track_name_multiple[n_mut] = []
+                track_name_multiple[n_mut].append(row["mutant"])
+        ordonater = np.argsort(ordonater)
+        track_name = [track_name_single[i] for i in ordonater]
+
+        for n_mut in track_name_multiple.keys():
+            track_name += track_name_multiple[n_mut]
+        landscape, gt_landscape = torch.load(f"{landscape_path}/{name}_landscape.pt")
+        landscape = landscape.cpu().numpy()
+        gt_landscape = gt_landscape.cpu().numpy()
+        print("Spearmanr", spearmanr(gt_landscape, landscape)[0])
+        landscape_dict = {k:v for k, v in zip(track_name, landscape)}
+        gt_landscape_dict = {k:v for k, v in zip(track_name, gt_landscape)}
+        landscape_dict_sorted = [landscape_dict[k] for k in df["mutant"]]
+        gt_landscape_dict_sorted = [gt_landscape_dict[k] for k in df["mutant"]]
+        print("Spearmanr", spearmanr(gt_landscape_dict_sorted, landscape_dict_sorted)[0])
+        result_df = pd.DataFrame({"mutant": df["mutant"].values,
+                                  "DMS_score": df["DMS_score"].values,
+                                  "predicted_score": landscape_dict_sorted,
+                                  "gt_score": gt_landscape_dict_sorted,})
+        print("Spearmanr", spearmanr(result_df["DMS_score"], result_df["predicted_score"])[0])
+        result_df.to_csv(f"{save_path}/{name}.csv", index=False)
 
 def add_retrievals(alpha,
                    save_path,
@@ -220,7 +420,7 @@ def add_retrievals(alpha,
         if validation_only and name not in val_names:
             continue
         csv_filename = row["DMS_filename"]
-        msa_filename = csv_files_to_prot[csv_filename]
+        msa_filename = row["MSA_filename"][:-4] #csv_files_to_prot[csv_filename]
         msa_start = row["MSA_start"] - 1
         print("Processing:", name)
         torch.cuda.empty_cache()
@@ -245,8 +445,12 @@ def add_retrievals(alpha,
             one_hot_tokens = np.zeros((len(msa_tokens), len(msa_tokens[0]), 40))
             one_hot_tokens[np.arange(len(msa_tokens))[:, None], np.arange(len(msa_tokens[0])), msa_tokens] = 1
             print("Processing:", name)
-            if os.path.exists(os.path.join(cache_dir, name + f"_colabfold.npy")):
-                weights = np.load(os.path.join(cache_dir, name + f"_colabfold.npy"))
+            if msa_type == "colabfold":
+                if os.path.exists(os.path.join(cache_dir, name + f"_colabfold.npy")):
+                    weights = np.load(os.path.join(cache_dir, name + f"_colabfold.npy"))
+            elif msa_type == "proteingym":
+                if os.path.exists(os.path.join(cache_dir, name + f".npy")):
+                    weights = np.load(os.path.join(cache_dir, name + f".npy"))
             else:
                 sampler = MSASampler(0.98, 0.7)
                 weights = sampler.get_weights(msa_tokens)[1]
@@ -306,11 +510,8 @@ def add_retrievals(alpha,
                     [single_mutational_logits_retrieval, multiple_mutational_landscape_retrieval], 0)
             else:
                 landscape_retrieval = single_mutational_logits_retrieval
-            try:
-                landscape_mamba, gt_mut_landscape = torch.load(f"{out_folder}/{name}_landscape.pt")
-            except:
-                continue
-            landscape_mamba = landscape_mamba / 3
+            landscape_mamba, gt_mut_landscape = torch.load(f"{out_folder}/{name}_landscape.pt")
+            landscape_mamba = landscape_mamba / 1
             landscape = alpha * landscape_retrieval + (1 - alpha) * landscape_mamba
 
         sp = spearmanr(gt_mut_landscape, landscape)[0]
@@ -318,6 +519,65 @@ def add_retrievals(alpha,
         res[name] = sp
         torch.save((landscape, gt_mut_landscape), f"{save_path}/{name}_landscape.pt")
     torch.save(res, f"{save_path}/spearman.pt")
+
+
+def add_other_model(database_df, folder_list, out_folder, column_name_list, weights = None, order = None):
+    def get_coefficients(num_sequences):
+        if not isinstance(num_sequences, float):
+            return np.array([[0.5, 0.5]])
+        elif num_sequences < 10:
+            return np.array([[1., 0.]])
+        elif num_sequences < 10 ** 2:
+            return np.array([[0.7, 0.3]])
+        elif num_sequences < 10 ** 3:
+            return np.array([[0.4, 0.6]])
+        elif num_sequences < 10 ** 5:
+            return np.array([[0.3, 0.7]])
+        else:
+            return np.array([[0.2, 0.8]])
+
+    # if weights are not provided, use Linear Regression on val names to combine the landscapes:
+    folder_gt = "/data2/malbrank/protein_gym/substitutions/zero_shot_substitutions_scores/Ground_truth/"
+    res_csv = [{x["DMS_id"]: pd.read_csv(folder_list[k]+x["DMS_filename"])[column_name_list[k]].values for i, x in database_df.iterrows()} for k in range(len(folder_list))]
+    gt_csv = {x["DMS_id"]: pd.read_csv(folder_gt+x["DMS_filename"])["DMS_score"].values for i, x in database_df.iterrows()}
+    if weights is None:
+        """X_val = [np.array([res_csv[i][name] for i in range(len(res_csv))]) for name in val_names]
+        X_val = [x.reshape(len(res_csv), -1).T for x in X_val]
+        X_val = np.concatenate(X_val,)
+        y_val = [gt_csv[name] for name in val_names]
+        y_val = np.concatenate(y_val,)
+        reg = LinearRegression().fit(X_val, y_val)
+        weights = reg.coef_[None]
+        print(weights, spearmanr(reg.predict(X_val), y_val))"""
+            # MSA_N_eff
+        weights = None
+        if "EVE" not in out_folder:
+            weights = np.array([[0.5, 0.5]])
+
+    res = {}
+    X = [np.array([res_csv[i][name] for i in range(len(res_csv))]) for name in database_df["DMS_id"]]
+    X = [x.reshape(len(res_csv), -1).T for x in X]
+    if order is not None:
+        X = [x * order[None] for x in X]
+    X = [(x-x.max(0)[None]) for x in X]
+    X = [-x/x.mean(0)[None] for x in X]
+
+    if weights is not None:
+        pred = {x["DMS_id"]: (X[i]*weights).sum(1) for i, x in database_df.iterrows()}
+    else:
+        pred = {x["DMS_id"]: (X[i]* get_coefficients(x["MSA_N_eff"])).sum(1) for i, x in database_df.iterrows()}
+    if not os.path.exists(f"{out_folder}"):
+        os.mkdir(f"{out_folder}")
+    for i, row in database_df.iterrows():
+        name = row["DMS_id"]
+        p = pred[name]
+        csv_df = pd.read_csv(folder_gt+row["DMS_filename"])
+        df = pd.DataFrame({"mutant": csv_df["mutant"].values, "combined": p, "DMS_score": csv_df["DMS_score"].values})
+        df.to_csv(f"{out_folder}/{name}.csv", index=False)
+        sp = spearmanr(p, df["DMS_score"])[0]
+        print("Dataset:", name, "Spearman:", sp)
+        res[name] = sp
+    torch.save(res, f"{out_folder}/spearman.pt")
 
 
 def evaluate_all_landscapes(checkpoint,
@@ -362,7 +622,7 @@ def evaluate_all_landscapes(checkpoint,
         csv_files_to_prot[filename] = prot
 
     res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
+    for i, row in list(database_df.iterrows()):
 
         name = row["DMS_id"]
         if validation_only and name not in val_names:
@@ -370,7 +630,7 @@ def evaluate_all_landscapes(checkpoint,
         model = load_model(checkpoint,
                            model_class=MambaLMHeadModelwithPosids,
                            device="cuda",
-                           dtype=torch.bfloat16,
+                           dtype=torch.float32,
                            checkpoint_mixer="ckpmix" in prefix).eval()
 
         csv_filename = row["DMS_filename"]
@@ -407,9 +667,12 @@ def evaluate_all_landscapes(checkpoint,
         gt_mut_lanscape_multiple_dict = {}
         multiple_mutation_dict = {}
         single_mutation_only = True
+        too_much_mutations = False
         mutated_pos = set()
         for i, row in df.iterrows():
             muts = row["mutant"].split(":")
+            if len(muts) > 5:
+                too_much_mutations = True
             if len(muts) == 1:
                 mut_pos = int(row["mutant"][1:-1]) - msa_start - 1
                 mut_aa = row["mutant"][-1]
@@ -437,6 +700,7 @@ def evaluate_all_landscapes(checkpoint,
             logits_single = None
             landscape_single = None
             landscape_multiple = None
+            too_much_mutations = True
             for i in range(ensembling):
                 sample_idxs_small = sampler.get_sample_idxs(msa=msa, name=name + "_colabfold", size=msa_length,
                                                             result_cache_dir=cache_dir)[1:]
@@ -447,15 +711,19 @@ def evaluate_all_landscapes(checkpoint,
                     landscape_single = landscape_single_
                     logits_single = logits_single_
                     if not single_mutation_only:
-                        landscape_multiple_ = multiple_mutational_landscape_iid(landscape_single_,
-                                                                                multiple_mutation_dict)
+                        if too_much_mutations:
+                            landscape_multiple_ = multiple_mutational_landscape_iid(landscape_single_, multiple_mutation_dict)
+                        else:
+                            landscape_multiple_ = multiple_mutational_landscape(model, small_msa, multiple_mutation_dict, num_sequences=len(small_msa) - 1)
                         landscape_multiple = landscape_multiple_
                 else:
                     landscape_single += landscape_single_
                     logits_single += logits_single_
                     if not single_mutation_only:
-                        landscape_multiple_ = multiple_mutational_landscape_iid(landscape_single_,
-                                                                                multiple_mutation_dict)
+                        if too_much_mutations:
+                            landscape_multiple_ = multiple_mutational_landscape_iid(landscape_single_, multiple_mutation_dict)
+                        else:
+                            landscape_multiple_ = multiple_mutational_landscape(model, small_msa, multiple_mutation_dict, num_sequences=len(small_msa) - 1)
                         landscape_multiple += landscape_multiple_
             gt_mut_landscape_single_keep = gt_mut_landscape_single[keep_idx]
             landscape_single = landscape_single[keep_idx]
@@ -471,7 +739,8 @@ def evaluate_all_landscapes(checkpoint,
             torch.save(logits_single, f"{save_path}/{name}_logits.pt")
 
         sp = spearmanr(gt_landscape, landscape)[0]
-        print("Dataset:", name, "Spearman:", sp, "Single mutation only:", single_mutation_only)
+        print("Dataset:", name, "Spearman:", sp, "Single mutation only:", single_mutation_only, "Too much mutations:",
+              too_much_mutations)
         res[name] = sp
     torch.save(res, f"{save_path}/spearman.pt")
 
@@ -632,7 +901,7 @@ def grid_search(checkpoints, csv_folder, msa_folder, out_folder, database_df, ca
 
     for (preprefix, checkpoint), n_tokens, do_shuffle, max_similarity, max_dissimilarity, n_ensemble in product(
             checkpoints, possible_n_tokens, shuffle, similarities, dissimalirities, ensembling):
-        prefix = f"{preprefix}_colabfold_msa_poetsampling_maxsim{int(max_similarity * 100)}"
+        prefix = f"multiple"
         evaluate_all_landscapes(checkpoint,
                                 prefix,
                                 None,
@@ -642,7 +911,7 @@ def grid_search(checkpoints, csv_folder, msa_folder, out_folder, database_df, ca
                                 database_df,
                                 cache_dir,
                                 overwrite=False,
-                                validation_only=False,
+                                validation_only=True,
                                 max_similarity=max_similarity,
                                 max_dissimilarity=max_dissimilarity,
                                 max_msa_length=n_tokens,
@@ -652,25 +921,25 @@ def grid_search(checkpoints, csv_folder, msa_folder, out_folder, database_df, ca
 if __name__ == "__main__":
     data_dir = "/data2/malbrank/protein_gym"
     csv_folder = f"{data_dir}/substitutions/DMS_ProteinGym_substitutions/"
-    out_folder = f"{data_dir}/protein_gym/mut_effects_test/"
+    out_folder = f"{data_dir}/mut_effects/"
     database_df = pd.read_csv(f"{data_dir}/substitutions/DMS_substitutions.csv")
-    msa_folder_colabfold = f"{data_dir}/msa/colabfold/"
-    msa_folder_for_retrievals = f"{data_dir}/msa/proteingym/"
+    msa_folder_colabfold = f"{data_dir}/msa_files/colabfold/"
+    msa_folder_for_retrievals = f"{data_dir}/msa_files/proteingym/"
     cache_folder = f"{data_dir}/cache"
-    expe_name = "protmamba_long_finetuned"
-    checkpoints = [("new_mamba_ckpmix_ft", "/nvme1/common/mamba_100M_FIM-finetuned_131k_checkpoint-3200"), ]
+    expe_name = "protmamba_long_finetuned_wo_ensembling_float32"
+    checkpoints = [("protmamba_long_finetuned_wo_ensembling_float32", "/nvme1/common/mamba_100M_FIM-finetuned_131k_checkpoint-3200"), ]
 
     # Usage evaluate_all_landscapes
-    #evaluate_all_landscapes(checkpoints[0][0], expe_name,None, csv_folder, msa_folder_colabfold, out_folder, database_df, cache_folder, overwrite=False, validation_only=False,)
+    evaluate_all_landscapes(checkpoints[0][1], expe_name,None, csv_folder, msa_folder_colabfold, out_folder, database_df, cache_folder, overwrite=False, validation_only=False, max_msa_length=200, ensembling=1)
 
     # Usage for grid search
-    # grid_search(checkpoints, csv_folder, msa_folder_colabfold, out_folder, database_df, cache_folder)
+    #grid_search(checkpoints, csv_folder, msa_folder_colabfold, out_folder, database_df, cache_folder)
 
     # Usage for retrievals
-    for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]:
-        out_folder_ = f"{out_folder}/protmamba_long_finetuned_200"
+    for alpha in [0.5]:
+        out_folder_ = f"{out_folder}/protmamba_long_finetuned_wo_ensembling_msalength_200"
         save_path = out_folder_ + f"_with_retrievals_proteingym_{alpha}"
-        # add_retrievals(alpha, save_path, csv_folder, msa_folder_for_retrievals, out_folder_, database_df, cache_folder, validation_only=False, msa_type="proteingym")
+        add_retrievals(alpha, save_path, csv_folder, msa_folder_for_retrievals, out_folder_, database_df, cache_folder, validation_only=False, msa_type="proteingym")
 
     # usage for spearamnrs, auc, mcc, top10percentrecall, spearmanrs_by_depth
     out_folder_ = f"{out_folder}/{expe_name}"
@@ -690,3 +959,16 @@ if __name__ == "__main__":
     ]
     out_ensembled_folder = out_folder + "protmamba_long_finetuned_25_to_400"
     # ensemble_landscapes(to_ensemble_folders, out_ensembled_folder, validation_only=False)
+
+    # Usage for exporting to csv
+    landscape_path  = "/data2/malbrank/protein_gym/mut_effects/protmamba_long_finetuned_200_retrievals_0.5"
+    save_path = "/data2/malbrank/protein_gym/substitutions/zero_shot_substitutions_scores"
+    #export_to_csv(database_df, save_path, landscape_path)
+
+    # Usage for adding other model
+    folder_list = ["/data2/malbrank/protein_gym/substitutions/zero_shot_substitutions_scores/protmamba_long_finetuned_200_retrievals_0.5/",
+                   "/data2/malbrank/protein_gym/substitutions/zero_shot_substitutions_scores/EVE/",
+                   ]
+    out_folder = "/data2/malbrank/protein_gym/mut_effects/ProtMambaR_EVE/"
+    column_name_list = ["predicted_score", "evol_indices_ensemble",]
+    #add_other_model(database_df, folder_list, out_folder, column_name_list, weights = None, order = np.array([1, -1]))

@@ -132,8 +132,11 @@ def load_from_file(file_path):
         sequences = [str(record.seq) for record in SeqIO.parse(f, "fasta")]
     return sequences
 
-def generate_sequence(model, tokens, position_ids=None, seq_position_ids=None, is_fim=False, max_length=2000, temperature=1., top_p=0.0, top_k=1,
-                      return_dict_in_generate=False, output_scores=False, eos_token_id=AA_TO_ID["<cls>"], device="cuda"):
+def generate_sequence(model, tokens, position_ids=None, seq_position_ids=None, is_fim=False, max_length=1,
+                      temperature=1., top_p=0.0, top_k=1,
+                      return_dict_in_generate=False, output_scores=False, teacher_outputs=None,
+                      eos_token_id=AA_TO_ID["<cls>"],
+                      device="cuda"):
     """Generating, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
     Top-k and top-p can be used together. If top_k > 0 and top_p > 0, then top-k is applied first,
@@ -142,9 +145,10 @@ def generate_sequence(model, tokens, position_ids=None, seq_position_ids=None, i
     input_ids = tokens.to(device)
     position_ids = position_ids.to(device) if position_ids is not None else None
     seq_position_ids = seq_position_ids.to(device) if seq_position_ids is not None else None
+    teacher_outputs = teacher_outputs.to(device) if teacher_outputs is not None else None
     # generate sequence
     out = model.generate(input_ids=input_ids,
-                         position_ids=position_ids,
+                         position_ids=position_ids.clamp(0, 2000),
                          seq_position_ids=seq_position_ids,
                          is_fim=is_fim,
                          max_length=max_length,
@@ -153,15 +157,17 @@ def generate_sequence(model, tokens, position_ids=None, seq_position_ids=None, i
                          top_k=top_k,
                          return_dict_in_generate=return_dict_in_generate,
                          output_scores=output_scores,
-                         eos_token_id=eos_token_id)
+                         eos_token_id=eos_token_id,
+                         teacher_outputs=teacher_outputs)
     sequences = out.sequences
     dic = {"input": [decode_sequence(seq) for seq in sequences[:, :input_ids.shape[-1]].cpu().numpy()],
-            "generated": [decode_sequence(seq) for seq in sequences[:, input_ids.shape[-1]:].cpu().numpy()],
-            "input_tokens": [seq for seq in sequences[:, :input_ids.shape[-1]].cpu().numpy()],
-            "generated_tokens": [seq for seq in sequences[:, input_ids.shape[-1]:].cpu().numpy()]}
+           "generated": [decode_sequence(seq) for seq in sequences[:, input_ids.shape[-1]:].cpu().numpy()],
+           "input_tokens": [seq for seq in sequences[:, :input_ids.shape[-1]].cpu().numpy()],
+           "generated_tokens": [seq for seq in sequences[:, input_ids.shape[-1]:].cpu().numpy()]}
     if output_scores:
         dic["scores"] = np.array([el.to(torch.float32).cpu().numpy() for el in out.scores]).transpose(1, 0, 2)
     return dic
+
 
 def prepare_dataset_for_fim_generation(tokens, pos_ids):
     """
@@ -204,7 +210,8 @@ def prepare_tokens(context_tokens,
                    fim_strategy="no-scramble", # "multiple_span"
                    mask_fraction=0.2,
                    max_patches=5,
-                   add_position_ids="1d"): 
+                   add_position_ids="1d",
+                   shuffle=True):
     """Prepare the tokens for the model by applying the FIM strategy and masking the tokens.
     It uses custom tokenized sequences and position ids."""
 
@@ -213,13 +220,16 @@ def prepare_tokens(context_tokens,
                             mask_fraction=mask_fraction,
                             max_patches=max_patches,
                             add_position_ids=add_position_ids)
-    seq, pos_ids = data_class.sample_sequences(context_tokens.numpy()[0], num_sequences=num_sequences)
-    # convert to tensor and add batch dimension
-    seq = torch.asarray(seq, dtype=torch.int64)[None,:]
-    pos_ids = torch.asarray(pos_ids, dtype=torch.int64)[None,:]
-    seq = torch.cat([seq, target_tokens], dim=1)
-    pos_ids = torch.cat([pos_ids, target_pos_ids], dim=1)
-    return seq, pos_ids
+    if len(context_tokens) >= 1:
+        seq, pos_ids = data_class.sample_sequences(context_tokens.numpy()[0], num_sequences=num_sequences, shuffle=shuffle)
+        # convert to tensor and add batch dimension
+        seq = torch.asarray(seq, dtype=torch.int64)[None,:]
+        pos_ids = torch.asarray(pos_ids, dtype=torch.int64)[None,:]
+        seq = torch.cat([seq, target_tokens], dim=1)
+        pos_ids = torch.cat([pos_ids, target_pos_ids], dim=1)
+        return seq, pos_ids
+    else:
+        return target_tokens, target_pos_ids
 
 def prepare_target(target, use_fim=None):
     """Prepare the target sequence for the model using a custom tokenized sequence.

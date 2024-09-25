@@ -1,28 +1,17 @@
-import os
-import sys
-from sklearn.metrics import roc_auc_score, matthews_corrcoef
+import os, sys
+
+from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from itertools import product
 
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
 from mamba_ssm.utils.generation import *
-from tqdm import tqdm
 
-from ProtMamba_ssm import MambaLMHeadModelwithPosids, load_model, load_from_file, tokenizer, \
-    prepare_target, prepare_tokens, generate_sequence, AA_TO_ID
-from utils import MSASampler, Uniclust30_Dataset
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ['TORCH_USE_CUDA_DSA'] = "0"
-
-_checkpoints = {"protmamba_foundation": "/nvme1/common/mamba_100M_FIM_checkpoint_32k-100000",
-                "protmamba_finetuned": "/nvme1/common/mamba_100M_FIM_finetuned_32k_checkpoint-17000",
-
-                }
+from ProtMamba_ssm import MambaLMHeadModelwithPosids, load_model, load_from_file, tokenizer, AA_TO_ID
+from tests.utils import MSASampler
 
 val_names = ['CBS_HUMAN_Sun_2020',
              'R1AB_SARS2_Flynn_2022',
@@ -45,199 +34,259 @@ val_names = ['CBS_HUMAN_Sun_2020',
              'TRPC_SACS2_Chan_2017',
              'S22A1_HUMAN_Yee_2023_abundance']
 
-def single_mutational_landscape(model, msa, num_sequences=50, mutated_pos=None, batch_size=64, ):
-    """Generate the mutational landscape of a single protein sequence.
+CACHE_DIR = "/data2/malbrank/protein_gym/cache"
+if not os.path.exists(CACHE_DIR):
+    os.mkdir(CACHE_DIR)
+
+
+def prepare_target_for_mut_landscape(target, fim=None):
+    """Prepare the target for the mutational landscape generation.
+
+    Args:
+        target (torch.Tensor): the target sequence to prepare.
+        fim (list): a list of tuples indicating the start and end of the FIM regions."""
+    if fim is None:
+        return target, torch.arange(0, target.size(1), dtype=torch.long), 0
+    target_seq = target[0].clone()
+    target_pos_ids = torch.arange(0, target_seq.size(0), dtype=torch.long).clamp(0, 1500)
+    in_fim_target = []
+    not_in_fim_target = []
+    in_fim_target_pos_ids = []
+    not_in_fim_target_pos_ids = []
+    cursor = 0
+    for idx, (i, j) in enumerate(fim):
+        not_in_fim_target.append(target_seq[cursor: i])
+        not_in_fim_target.append(torch.ones(1, dtype=torch.long) * AA_TO_ID[f"<mask-{idx + 1}>"])
+        not_in_fim_target_pos_ids.append(target_pos_ids[cursor: i])
+        not_in_fim_target_pos_ids.append(target_pos_ids[i:i + 1])
+
+        in_fim_target.append(torch.ones(1, dtype=torch.long) * AA_TO_ID[f"<mask-{idx + 1}>"])
+        in_fim_target.append(target_seq[i: j])
+        in_fim_target_pos_ids.append(target_pos_ids[i:i + 1])
+        in_fim_target_pos_ids.append(target_pos_ids[i: j])
+        cursor = j
+    not_in_fim_target.append(target_seq[cursor:])
+    not_in_fim_target.append(torch.ones(1, dtype=torch.long) * 2)
+    not_in_fim_target = torch.cat(not_in_fim_target, 0)
+
+    not_in_fim_target_pos_ids.append(target_pos_ids[cursor:])
+    not_in_fim_target_pos_ids.append(torch.zeros(1, dtype=torch.long))
+    not_in_fim_target_pos_ids = torch.cat(not_in_fim_target_pos_ids, 0)
+
+    in_fim_target = torch.cat(in_fim_target, 0)
+    in_fim_target_pos_ids = torch.cat(in_fim_target_pos_ids, 0)
+    return (torch.cat([not_in_fim_target, in_fim_target], 0)[None],
+            torch.cat([not_in_fim_target_pos_ids, in_fim_target_pos_ids], 0)[None],
+            len(not_in_fim_target))
+
+
+def mutational_landscape_full(model, mutations_lists, msa, batch_size=16, device="cuda:0"):
+    """Generate the mutational landscape of a single protein sequence by having full probabiltiies when possible.
     Args:
         model (MambaLMHeadModelwithPosids): the model to use for generation.
+        mutations_lists (list): a list of lists of mutations to evaluate.
         msa (list): a list of sequences in the MSA.
-        num_sequences (int): the number of sequences to sample from the MSA.
-        mutated_pos (list): a list of positions that have been mutated.
         batch_size (int): the batch size to use for generation.
         """
     target_sequence = msa[:1]
-    context_msa = msa[1:][::-1]
+    context_msa = msa[::-1]
     all_mut_effects = []
-    all_logits = []
-    sequence_length = len(target_sequence[0])
+    target: torch.Tensor = tokenizer(target_sequence, concatenate=True)
+    context_tokens = tokenizer(context_msa, concatenate=False)
+    context_pos_ids = torch.cat([torch.arange(0, len(seq), dtype=torch.long) for seq in context_tokens], 0)[None]
+    context_tokens = torch.cat(context_tokens, 0)[None]
 
-    for i in tqdm(range(0, sequence_length, batch_size), desc="Generating mutational landscape"):
-        torch.cuda.empty_cache()
-        # Tokenize the sequences and concatenate them into a single array
-        target = tokenizer(target_sequence, concatenate=True)
-        target_full = target.clone()
-        tokens = tokenizer(context_msa, concatenate=True)
-        batch_mut_effects = []
-        batch_logits = []
-        for j in range(i, min(i + batch_size, sequence_length)):
-            if j not in mutated_pos:
-                batch_mut_effects.append(torch.zeros(20).cpu())
-                continue
-            gt = target_full[0, j + 1].int().item()
-            use_fim = {"<mask-1>": ((j + 1, j + 2), 1)}
-            """if sequence_length > 1500:
-                target = tokenizer([target_sequence[0][max(0,j-750):j+750]], concatenate=True)
-                tokens = tokenizer([seq[max(0,j-750):j+750] for seq in context_msa], concatenate=True)
-                if j>750:
-                    use_fim = {f"<mask-1>": ((750, 751), 1)}"""
-            input_seq, targ_pos, is_fim_dict = prepare_target(target, use_fim=use_fim)
-            context_tokens, context_pos_ids = prepare_tokens(tokens,
-                                                             target_tokens=input_seq,
-                                                             target_pos_ids=targ_pos,
-                                                             DatasetClass=Uniclust30_Dataset,
-                                                             num_sequences=num_sequences,
-                                                             fim_strategy="multiple_span",
-                                                             mask_fraction=0,
-                                                             max_patches=0,
-                                                             add_position_ids="1d")
+    targets = []
+    gts = []
+    start_fims = []
+    mut_pointer = {}
+    for i, mut_list in enumerate(mutations_lists):
+        gt = target.clone()
+        tg = target.clone()
+        fim_list = []
+        sorted(mut_list, key=lambda x: x[0])
+        for mut in mut_list:
+            if len(mut) > 5:
+                return mutational_landscape(model, mutations_lists, msa, batch_size=batch_size, device=device)
+            tg[0, mut[0] + 1] = AA_TO_ID[mut[1]]
+            fim_list.append([mut[0] + 1, mut[0] + 2])
+            if str(mut_list[:-1]) + "/" + str(mut_list[-1][0]) not in mut_pointer:
+                mut_pointer[str(mut_list[:-1]) + "/" + str(mut_list[-1][0])] = []
+            mut_pointer[str(mut_list[:-1]) + "/" + str(mut_list[-1][0])].append(i)
+        target_seq, target_pos_ids, start_fim = prepare_target_for_mut_landscape(tg, fim=fim_list)
+        gt_seq, gt_pos_ids, gt_start_fim = prepare_target_for_mut_landscape(gt, fim=fim_list)
+        targets.append((target_seq, target_pos_ids))
+        gts.append((gt_seq, gt_pos_ids))
+        start_fims.append(start_fim)
+    reverse_single_mut_pointer = {}
+    for k, v in mut_pointer.items():
+        for vv in v:
+            reverse_single_mut_pointer[vv] = v[0]
+    non_redundant = [v[0] for v in mut_pointer.values()]
+    non_redundant_vectors_logits = {}
+    non_redundant_gt_vectors_logits = {}
+    with torch.no_grad():
+        for i in tqdm(range(0, len(non_redundant), batch_size), desc="Generating landscapes"):
+            inputs_ids = []
+            input_pos_ids = []
+            gt_inputs_ids = []
+            gt_input_pos_ids = []
+            seq_length = []
+            target_seqs = []
+            gt_seqs = []
+            for j in range(i, min(i + batch_size, len(non_redundant))):
+                cursor = non_redundant[j]
+                target_seq, target_pos_ids = targets[cursor]
+                target_seqs.append(target_seq)
+                gt_seq, gt_pos_ids = gts[cursor]
+                gt_seqs.append(gt_seqs)
 
-            output = generate_sequence(model,
-                                       context_tokens,
-                                       position_ids=context_pos_ids,
-                                       is_fim=is_fim_dict,
-                                       max_length=1,
-                                       temperature=1.,
-                                       top_k=3,
-                                       top_p=0.0,
-                                       return_dict_in_generate=True,
-                                       output_scores=True,
-                                       eos_token_id=AA_TO_ID["<cls>"],
-                                       device="cuda")
-            logits = torch.tensor(output["scores"])
-            logits_mut = logits[0, 0].log_softmax(-1)
-            mut_effect = logits_mut - logits_mut[gt]
-            mut_effect = mut_effect[4:24]
-            batch_mut_effects.append(torch.tensor(mut_effect).cpu())
-            batch_logits.append(torch.tensor(logits_mut).cpu())
-        all_mut_effects.extend(batch_mut_effects)
-        all_logits.extend(batch_logits)
-    all_mut_effects = torch.stack(all_mut_effects, 0)
-    all_logits = torch.stack(all_logits, 0)
-    return all_mut_effects, all_logits
+                inputs_ids.append(torch.cat([context_tokens, target_seq], 1))
+                input_pos_ids.append(torch.cat([context_pos_ids, target_pos_ids], 1))
+                gt_inputs_ids.append(torch.cat([context_tokens, gt_seq], 1))
+                gt_input_pos_ids.append(torch.cat([context_pos_ids, gt_pos_ids], 1))
+                seq_length.append(target_seq.size(1) + context_tokens.size(1))
+            max_seq_len = max(seq_length)
+            inputs_ids = torch.cat([torch.cat([x, torch.zeros(1, max_seq_len - x.size(1), dtype=torch.long)],
+                                              1) if max_seq_len - x.size(1) > 0 else x for x in inputs_ids], 0)
+            input_pos_ids = torch.cat([torch.cat([x, torch.zeros(1, max_seq_len - x.size(1), dtype=torch.long)],
+                                                 1) if max_seq_len - x.size(1) > 0 else x for x in input_pos_ids], 0)
+            gt_inputs_ids = torch.cat([torch.cat([x, torch.zeros(1, max_seq_len - x.size(1), dtype=torch.long)],
+                                                 1) if max_seq_len - x.size(1) > 0 else x for x in gt_inputs_ids], 0)
+            gt_input_pos_ids = torch.cat([torch.cat([x, torch.zeros(1, max_seq_len - x.size(1), dtype=torch.long)],
+                                                    1) if max_seq_len - x.size(1) > 0 else x for x in gt_input_pos_ids],
+                                         0)
+
+            target_output = model(inputs_ids.to(device), position_ids=input_pos_ids.to(device), ).logits.cpu().float()
+            gt_output = model(gt_inputs_ids.to(device), position_ids=gt_input_pos_ids.to(device), ).logits.cpu().float()
+
+            for j in range(len(seq_length)):
+                start_fim = start_fims[j] + context_tokens.size(1)
+                seq_len = seq_length[j] + context_tokens.size(1)
+                target_logits = target_output[j, start_fim - 1:seq_len - 1].log_softmax(-1)
+                gt_logits = gt_output[j, start_fim - 1:seq_len - 1].log_softmax(-1)
+                target_logits = target_logits[1::2]
+                gt_logits = gt_logits[1::2]
+                non_redundant_vectors_logits[non_redundant[i + j]] = target_logits
+                non_redundant_gt_vectors_logits[non_redundant[i + j]] = gt_logits
+    for i in range(0, len(mutations_lists)):
+        target_logits = non_redundant_vectors_logits[reverse_single_mut_pointer[i]]
+        gt_logits = non_redundant_gt_vectors_logits[reverse_single_mut_pointer[i]]
+        target_seq = targets[i][0]
+        start_fim = start_fims[i]
+        gt_seq = gts[i][0]
+
+        mut_effect = (target_logits[:, target_seq[0, start_fim:][1::2]] - gt_logits[:,
+                                                                          gt_seq[0, start_fim:][1::2]]).sum().item()
+        all_mut_effects.append(mut_effect)
+    return all_mut_effects
 
 
-def multiple_mutational_landscape_iid(landscape, mutation_dict):
-    all_mut_effects = {}
-    for n_mut, mutation_list in mutation_dict.items():
-        all_mut_effects[n_mut] = []
-        mut_effect = torch.zeros(len(mutation_list))
-        for i in tqdm(range(0, len(mutation_list))):
-            muts = mutation_list[i]
-            for j in range(n_mut):
-                mut_effect[i] += landscape[muts[j][0], AA_TO_ID[muts[j][1]] - 4]
-        all_mut_effects[n_mut] = mut_effect.cpu()
-
-    return torch.cat([torch.tensor(all_mut_effects[n_mut]) for n_mut in all_mut_effects.keys()], 0).cpu()
-
-
-def ensemble_landscapes(folders,
-                        save_path,
-                        overwrite=True,
-                        validation_only=False,
-                        weights=None):
-    r"""Ensemble the landscapes from different folders
-
+def mutational_landscape(model, mutations_lists, msa, batch_size=8, device="cuda:0"):
+    """Generate the mutational landscape of a single protein sequence independantly summing pointwise effects.
     Args:
-        folders (list): list of folders containing the landscapes
-        save_path (str): path to save the ensembled landscapes
-        overwrite (bool): whether to overwrite the existing files
-        validation_only (bool): whether to evaluate only the validation set
-        weights (dict): weights for each folder
-    """
-    if not os.path.exists(f"{save_path}"):
-        os.mkdir(f"{save_path}")
-    res = {}
-    for i, row in database_df.iterrows():
-        name = row["DMS_id"]
-        if validation_only and name not in val_names:
-            continue
-        if f"{name}_landscape.pt" in os.listdir(save_path) and not overwrite:
-            landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-        else:
-            landscape, gt_landscape = None, None
-            for folder in folders:
-                if f"{name}_landscape.pt" not in os.listdir(folder):
-                    continue
-                landscape_, gt_landscape = torch.load(f"{folder}/{name}_landscape.pt")
-                if weights is not None:
-                    if landscape is None:
-                        landscape = weights[folder] * landscape_
-                    else:
-                        landscape += weights[folder] * landscape_
-                else:
-                    if landscape is None:
-                        landscape = landscape_
-                    else:
-                        landscape += landscape_
-            if landscape is None:
-                continue
-            torch.save((landscape, gt_landscape), f"{save_path}/{name}_landscape.pt")
+        model (MambaLMHeadModelwithPosids): the model to use for generation.
+        mutations_lists (list): a list of lists of mutations to evaluate.
+        msa (list): a list of sequences in the MSA.
+        batch_size (int): the batch size to use for generation.
+        device (str): the device to use for generation.
+        """
+    target_sequence = msa[:1]
+    context_msa = msa[::-1]
+    all_mut_effects = []
+    target: torch.Tensor = tokenizer(target_sequence, concatenate=True)
+    context_tokens = tokenizer(context_msa, concatenate=False)
+    context_pos_ids = torch.cat([torch.arange(0, len(seq), dtype=torch.long) for seq in context_tokens], 0)[None].clamp(
+        0, 2000)
+    context_tokens = torch.cat(context_tokens, 0)[None]
+    mut_pointer = {}
+    for i, mut_list in enumerate(mutations_lists):
+        for mut in mut_list:
+            if mut[0] not in mut_pointer:
+                mut_pointer[mut[0]] = []
+            mut_pointer[mut[0]].append(i)
+    non_redundant = list(mut_pointer.keys())
+    non_redundant_vectors_logits = {}
+    with torch.no_grad():
+        for i in tqdm(range(0, len(non_redundant), batch_size), desc="Generating landscapes"):
+            inputs_ids = []
+            input_pos_ids = []
+            seq_length = []
+            target_seqs = []
+            for j in range(i, min(i + batch_size, len(non_redundant))):
+                cursor = non_redundant[j]
+                target_seq, target_pos_ids, start = prepare_target_for_mut_landscape(target,
+                                                                                     fim=[[cursor + 1, cursor + 2]])
+                target_seqs.append(target_seq)
 
-        sp = spearmanr(gt_landscape, landscape)[0]
-        print("Dataset:", name, "Spearman:", sp)
-        res[name] = sp
+                inputs_ids.append(torch.cat([context_tokens, target_seq], 1))
+                input_pos_ids.append(torch.cat([context_pos_ids, target_pos_ids], 1))
+                seq_length.append(target_seq.size(1) + context_tokens.size(1))
+            max_seq_len = max(seq_length)
+            inputs_ids = torch.cat([torch.cat([x, torch.zeros(1, max_seq_len - x.size(1), dtype=torch.long)],
+                                              1) if max_seq_len - x.size(1) > 0 else x for x in inputs_ids], 0)
+            input_pos_ids = torch.cat([torch.cat([x, torch.zeros(1, max_seq_len - x.size(1), dtype=torch.long)],
+                                                 1) if max_seq_len - x.size(1) > 0 else x for x in input_pos_ids], 0)
 
-        torch.save(res, f"{save_path}/spearman.pt")
+            target_output = model(inputs_ids.to(device), position_ids=input_pos_ids.to(device), ).logits.cpu().float()
+
+            for j in range(len(seq_length)):
+                seq_len = seq_length[j]
+                target_logits = target_output[j, seq_len - 2][4:24].log_softmax(-1)
+                non_redundant_vectors_logits[non_redundant[i + j]] = target_logits
+    for i in range(0, len(mutations_lists)):
+        logits = [non_redundant_vectors_logits[mut[0]] for mut in mutations_lists[i]]
+        target_tokens = [AA_TO_ID[mut[1]] - 4 for mut in mutations_lists[i]]
+        gt_tokens = [target[0, mut[0] + 1].item() - 4 for mut in mutations_lists[i]]
+
+        mut_effect = (torch.stack(logits)[torch.arange(len(logits)), target_tokens] - torch.stack(logits)[
+            torch.arange(len(logits)), gt_tokens]).sum().item()
+        all_mut_effects.append(mut_effect)
+    return all_mut_effects
 
 
 def add_retrievals(alpha,
                    save_path,
                    csv_folder,
                    msa_folder,
-                   out_folder,
                    database_df,
                    cache_dir,
                    validation_only=True,
-                   msa_type="colabfold",
                    ):
     r"""
     Add the retrievals to the landscapes
 
     Args:
         alpha (float): alpha for the retrieval
-        save_path (str): path to the output folder
-        csv_folder (str): path to the csv folder
-        msa_folder (str): path to the msa folder
-        out_folder (str): path to the output folder
-        database_df (pd.DataFrame): dataframe containing the database
+        save_path (str): path to the save folder to save spearman correlation
+        csv_folder (str): path to the csv folder that contains the protmamba predictions
+        msa_folder (str): path to the msa folder that contains colabfold msa
+        database_df (pd.DataFrame): dataframe containing the protein gym list of DMS
         cache_dir (str): path to the cache directory
         validation_only (bool): whether to evaluate only the validation set
-        msa_type (str): type of MSA
     """
     if not os.path.exists(f"{save_path}"):
         os.mkdir(f"{save_path}")
-
-    csv_files = os.listdir(csv_folder)
-    csv_files = [f for f in csv_files if f.endswith(".csv")]
-    csv_files_to_prot = {}
-    for filename in csv_files:
-        prot = "_".join(filename.split("_")[:2])
-        csv_files_to_prot[filename] = prot
-
     res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
-
+    for i, row in list(database_df.iterrows()):
         name = row["DMS_id"]
         if validation_only and name not in val_names:
             continue
         csv_filename = row["DMS_filename"]
-        msa_filename = csv_files_to_prot[csv_filename]
+        msa_filename = row["MSA_filename"][:-4]
         msa_start = row["MSA_start"] - 1
         print("Processing:", name)
         torch.cuda.empty_cache()
         if "indels" in csv_filename:
             continue
-        if os.path.exists(msa_folder + msa_filename + ".a3m", ):
-            msa = load_from_file(msa_folder + msa_filename + ".a3m", )
-        elif os.path.exists(msa_folder + msa_filename.split("_")[0] + ".a3m", ):
-            msa = load_from_file(msa_folder + msa_filename.split("_")[0] + ".a3m", )
-        elif os.path.exists(msa_folder + msa_filename + ".a2m", ):
+        if os.path.exists(msa_folder + msa_filename + ".a2m", ):
             msa = load_from_file(msa_folder + msa_filename + ".a2m", )
-
         else:
-            print("No MSA found for:", msa_folder + msa_filename + ".a3m", )
+            print("No MSA found for:", msa_folder + msa_filename + ".a2m", )
             continue
-        if f"{name}_landscape.pt" in os.listdir(save_path):
-            landscape, gt_mut_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
+        df = pd.read_csv(csv_folder + csv_filename)
+        if f"retrieved_score_alpha_{alpha}" in df.columns:
+            ()
         else:
             msa = [seq for seq in msa]
             msa_tokens = [[AA_TO_ID[aa.upper()] for aa in seq] for seq in msa]
@@ -245,111 +294,172 @@ def add_retrievals(alpha,
             one_hot_tokens = np.zeros((len(msa_tokens), len(msa_tokens[0]), 40))
             one_hot_tokens[np.arange(len(msa_tokens))[:, None], np.arange(len(msa_tokens[0])), msa_tokens] = 1
             print("Processing:", name)
-            if os.path.exists(os.path.join(cache_dir, name + f"_colabfold.npy")):
-                weights = np.load(os.path.join(cache_dir, name + f"_colabfold.npy"))
+            if os.path.exists(os.path.join(cache_dir, name + f".npy")):
+                weights = np.load(os.path.join(cache_dir, name + f".npy"))
             else:
                 sampler = MSASampler(0.98, 0.7)
                 weights = sampler.get_weights(msa_tokens)[1]
-                np.save(os.path.join(cache_dir, name + f"_colabfold.npy"),
-                        weights) if msa_type == "colabfold" else np.save(os.path.join(cache_dir, name + f".npy"),
-                                                                         weights)
-                weights = np.load(
-                    os.path.join(cache_dir, name + f"_colabfold.npy")) if msa_type == "colabfold" else np.load(
-                    os.path.join(cache_dir, name + f".npy"))
+                np.save(os.path.join(cache_dir, name + f".npy"), weights)
+
             one_hot_tokens = one_hot_tokens * weights[:, None, None]
             one_hot_tokens = one_hot_tokens.sum(0)
             one_hot_tokens = one_hot_tokens[:, 4:24] + 1 / len(msa)
             one_hot_tokens_sum = one_hot_tokens.sum(-1)
             one_hot_tokens = one_hot_tokens / one_hot_tokens_sum[:, None]
-
             one_hot_tokens = torch.tensor(one_hot_tokens).float()
-
-            df = pd.read_csv(csv_folder + csv_filename)
-            gt_mut_landscape_single = torch.ones((len(msa[0]), 20)) * np.inf
-            gt_mut_lanscape_multiple_dict = {}
-            multiple_mutation_dict = {}
-            single_mutation_only = True
-            mutated_pos = set()
-            for i, row in df.iterrows():
-                muts = row["mutant"].split(":")
-                if len(muts) == 1:
-                    mut_pos = int(row["mutant"][1:-1]) - msa_start - 1
-                    mut_aa = row["mutant"][-1]
-                    eff = float(row["DMS_score"])
-                    mut_aa_id = AA_TO_ID[mut_aa] - 4
-                    if mut_pos > len(msa[0]) - 1:
-                        continue
-                    gt_mut_landscape_single[mut_pos, mut_aa_id] = eff
-                    mutated_pos.add(mut_pos)
-                else:
-                    single_mutation_only = False
-                    muts = [(int(mut[1:-1]) - msa_start - 1, mut[-1]) for mut in muts]
-                    n_mut = len(muts)
-                    if n_mut not in multiple_mutation_dict:
-                        multiple_mutation_dict[n_mut] = []
-                        gt_mut_lanscape_multiple_dict[n_mut] = []
-                    multiple_mutation_dict[n_mut].append(muts)
-                    gt_mut_lanscape_multiple_dict[n_mut].append(float(row["DMS_score"]))
-                    for mut in muts:
-                        mutated_pos.add(mut[0])
-            keep_idx = torch.where(gt_mut_landscape_single != np.inf)
 
             gt = msa_tokens[0]
             logits = one_hot_tokens.log()
             logits = logits - logits[torch.arange(len(logits)), gt - 4][:, None]
 
-            single_mutational_logits_retrieval = logits[keep_idx]
-            if not single_mutation_only:
-                multiple_mutational_landscape_retrieval = multiple_mutational_landscape_iid(logits,
-                                                                                            multiple_mutation_dict)
-                landscape_retrieval = torch.cat(
-                    [single_mutational_logits_retrieval, multiple_mutational_landscape_retrieval], 0)
-            else:
-                landscape_retrieval = single_mutational_logits_retrieval
-            try:
-                landscape_mamba, gt_mut_landscape = torch.load(f"{out_folder}/{name}_landscape.pt")
-            except:
-                continue
-            landscape_mamba = landscape_mamba / 3
-            landscape = alpha * landscape_retrieval + (1 - alpha) * landscape_mamba
-
+            df = pd.read_csv(csv_folder + csv_filename)
+            retrieved_scores = []
+            for i, row in tqdm(df.iterrows()):
+                muts = row["mutant"].split(":")
+                pred_score = float(row["predicted_score"])
+                iid_score = 0
+                for mut in muts:
+                    pos = int(mut[1:-1]) - msa_start - 1
+                    aa = AA_TO_ID[mut[-1]]
+                    iid_score += logits[pos, aa - 4].item()
+                retrieved_score = (1 - alpha) * pred_score + alpha * iid_score
+                retrieved_scores.append(retrieved_score)
+            df[f"retrieved_score_alpha_{alpha}"] = retrieved_scores
+            df.to_csv(csv_folder + csv_filename, index=False)
+        landscape = np.array(df[f"retrieved_score_alpha_{alpha}"])
+        gt_mut_landscape = np.array(df["DMS_score"])
         sp = spearmanr(gt_mut_landscape, landscape)[0]
-        print("Dataset:", name, "Spearman:", sp)
         res[name] = sp
-        torch.save((landscape, gt_mut_landscape), f"{save_path}/{name}_landscape.pt")
+        print("Dataset:", name, "Spearman:", sp)
     torch.save(res, f"{save_path}/spearman.pt")
 
 
-def evaluate_all_landscapes(checkpoint,
-                            prefix,
-                            n_tokens_,
+def evaluate_one_csv(csv_file, out_file, cache_dir, model_config, mamba_config, retrieval_config=None,
+                     device="cuda:0"):
+    r"""
+    Evaluate one landscape
+
+    Args:
+        csv_file (str): path to the csv file
+        out_file (str): path to the output file
+        cache_dir (str): path to the cache directory
+        model_config (dict): dictionary containing the model configuration
+        mamba_config (dict): dictionary containing the mamba configuration
+        retrieval_config (dict): dictionary containing the retrieval configuration
+        device (str): device to use for evaluation
+    """
+    name = mamba_config.get("name", csv_file.split("/")[-1][:-4])
+    n_tokens = mamba_config.get("n_tokens", None)
+    max_msa_length = mamba_config.get("max_msa_length", 50)
+    msa_start = mamba_config.get("msa_start", 0)
+    msa_len = mamba_config.get("msa_len", None)
+    msa_file = mamba_config.get("msa_file", None)
+    overwrite = mamba_config.get("overwrite", True)
+    max_similarity = mamba_config.get("max_similarity", 0.98)
+    max_dissimilarity = mamba_config.get("max_dissimilarity", 0.7)
+    ensembling = mamba_config.get("ensembling", 1)
+    mutational_landscap_fctn = mamba_config.get("mutation_landcape_fct", mutational_landscape)
+
+    if os.path.exists(out_file) and not overwrite:
+        df = pd.read_csv(out_file)
+        sp = spearmanr(df["DMS_score"], df["predicted_score"])[0]
+        print("Dataset:", name, "Spearman:", sp)
+        return df, sp
+
+    msa = load_from_file(msa_file)
+    msa = [seq[msa_start:] for seq in msa]
+    if msa_len is not None:
+        msa = [seq[:msa_len] for seq in msa]
+    first_seq = msa[0]
+    if n_tokens is not None:
+        len_first_seq = min(len(first_seq), 1500)
+        msa_length = n_tokens // len_first_seq
+    else:
+        n_tokens = len(first_seq) * max_msa_length
+        n_tokens = min(n_tokens, 200000)
+        msa_length = n_tokens // len(first_seq)
+    msa_length = min(msa_length, 800)
+    print("Processing:", name, " with length:", msa_length)
+
+    df = pd.read_csv(csv_file)
+    mutations_lists = []
+    labels = []
+    gt_landscape = []
+
+    for i, row in df.iterrows():
+        labels.append(row["mutant"])
+        muts = row["mutant"].split(":")
+        muts = [(int(mut[1:-1]) - msa_start - 1, mut[-1]) for mut in muts]
+        mutations_lists.append(muts)
+        gt_landscape.append(float(row["DMS_score"]))
+    gt_landscape = np.array(gt_landscape)
+    landscapes = []
+
+    model = load_model(model_config.get("checkpoint", None),
+                       model_class=model_config.get("model_class", MambaLMHeadModelwithPosids),
+                       device=device,
+                       dtype=torch.bfloat16,
+                       checkpoint_mixer=model_config.get("checkpoint_mixer", False)).eval()
+    sampler = MSASampler(max_similarity, max_dissimilarity)
+    for i in range(ensembling):
+        sample_idxs_small = sampler.get_sample_idxs(msa=msa, name=name + "_colabfold", size=msa_length,
+                                                    result_cache_dir=cache_dir)[1:]
+        small_msa = [first_seq] + [msa[i] for i in sample_idxs_small]
+        landscape = mutational_landscap_fctn(model, mutations_lists, small_msa, device=device)
+        landscapes.append(np.array(landscape))
+    sum_landscape = np.mean(landscapes, 0)
+    sp = spearmanr(gt_landscape, sum_landscape)[0]
+    print("Dataset:", name, "Spearman:", sp)
+    result_dict = {"mutant": labels,
+                   "DMS_score": gt_landscape,
+                   "predicted_score": sum_landscape}
+    if ensembling > 1:
+        for i in range(ensembling):
+            result_dict[f"predicted_score_{i}"] = landscapes[i]
+    result_df = pd.DataFrame(result_dict)
+    result_df.to_csv(f"{save_path}/{name}.csv", index=False)
+    if retrieval_config is not None:
+        alpha = retrieval_config.get("alpha", 0.5)
+        msa_folder = retrieval_config.get("msa_folder", "")
+        add_retrievals(alpha=alpha,
+                       save_path=f"{save_path}_with_retrievals",
+                       csv_folder=csv_folder,
+                       msa_folder=msa_folder,
+                       database_df=database_df,
+                       cache_dir=cache_dir,
+                       validation_only=False, )
+    return result_df, sp
+
+
+def evaluate_all_landscapes(prefix,
                             csv_folder,
                             msa_folder,
                             out_folder,
                             database_df,
-                            cache_dir,
-                            overwrite=True,
+                            model_config,
+                            mamba_config,
+                            retrieval_config,
+                            cache_dir=CACHE_DIR,
                             validation_only=True,
-                            max_similarity=0.98,
-                            max_dissimilarity=0.7,
-                            max_msa_length=50,
-                            ensembling=3, ):
+                            device="cuda:0"):
     r"""
     Evaluate all spearmanr correlation for every landscape
 
     Args:
-        checkpoint (str): path to the checkpoint
         prefix (str): prefix for the output folder
-        n_tokens_ (int): number of tokens
         csv_folder (str): path to the csv folder
         msa_folder (str): path to the msa folder
         out_folder (str): path to the output folder
-        database_df (pd.DataFrame): dataframe containing the database
-        overwrite (bool): whether to overwrite the existing files
+        database_df (pd.DataFrame): dataframe containing the protein gym list of DMS
+        mamba_config (dict): dictionary containing the mamba configuration
+        retrieval_config (dict): dictionary containing the retrieval configuration
+        cache_dir (str): path to the cache directory
         validation_only (bool): whether to evaluate only the validation set
-        max_similarity (float): maximum similarity for PoET sampling
-        max_dissimilarity (float): maximum dissimilarity for PoET sampling
+        device (str): device to use for evaluation
     """
+    n_tokens_ = mamba_config.get("n_tokens", None)
+    max_msa_length = mamba_config.get("max_msa_length", 50)
+    overwrite = mamba_config.get("overwrite", True)
     save_path = f"{out_folder}/{prefix}_{n_tokens_}/" if n_tokens_ is not None else f"{out_folder}/{prefix}_msalength_{max_msa_length}/"
     if not os.path.exists(f"{save_path}"):
         os.mkdir(f"{save_path}")
@@ -362,331 +472,104 @@ def evaluate_all_landscapes(checkpoint,
         csv_files_to_prot[filename] = prot
 
     res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
+    for i, row in list(database_df.iterrows()):
 
         name = row["DMS_id"]
         if validation_only and name not in val_names:
             continue
-        model = load_model(checkpoint,
-                           model_class=MambaLMHeadModelwithPosids,
-                           device="cuda",
-                           dtype=torch.bfloat16,
-                           checkpoint_mixer="ckpmix" in prefix).eval()
-
+        if f"{name}_landscape.csv" in os.listdir(save_path) and not overwrite:
+            continue
         csv_filename = row["DMS_filename"]
         msa_filename = csv_files_to_prot[csv_filename]
         msa_start = row["MSA_start"] - 1
         msa_len = row["MSA_len"]
-        print("Processing:", name)
         torch.cuda.empty_cache()
-        if "indels" in csv_filename:
-            continue
-        if os.path.exists(msa_folder + msa_filename + ".a3m", ):
-            msa = load_from_file(msa_folder + msa_filename + ".a3m", )
-        elif os.path.exists(msa_folder + msa_filename.split("_")[0] + ".a3m", ):
-            msa = load_from_file(msa_folder + msa_filename.split("_")[0] + ".a3m", )
-        else:
-            print("No MSA found for:", msa_folder + msa_filename + ".a3m", )
-            continue
-        msa = [seq[msa_start:msa_start + msa_len] for seq in msa]
-        first_seq = msa[0]
-        if n_tokens_ is not None:
-            len_first_seq = min(len(first_seq), 1500)
-            msa_length = n_tokens_ // len_first_seq
-        else:
-            n_tokens = len(first_seq) * max_msa_length
-            n_tokens = min(n_tokens, 200000)
-            msa_length = n_tokens // len(first_seq)
-        msa_length = min(msa_length, 800)
-
-        print("Processing:", name, " with length:", msa_length)
-        sampler = MSASampler(max_similarity, max_dissimilarity)
-
-        df = pd.read_csv(csv_folder + csv_filename)
-        gt_mut_landscape_single = torch.ones((len(msa[0]), 20)) * np.inf
-        gt_mut_lanscape_multiple_dict = {}
-        multiple_mutation_dict = {}
-        single_mutation_only = True
-        mutated_pos = set()
-        for i, row in df.iterrows():
-            muts = row["mutant"].split(":")
-            if len(muts) == 1:
-                mut_pos = int(row["mutant"][1:-1]) - msa_start - 1
-                mut_aa = row["mutant"][-1]
-                eff = float(row["DMS_score"])
-                mut_aa_id = AA_TO_ID[mut_aa] - 4
-                if mut_pos > len(msa[0]) - 1:
-                    continue
-                gt_mut_landscape_single[mut_pos, mut_aa_id] = eff
-                mutated_pos.add(mut_pos)
-            else:
-                single_mutation_only = False
-                muts = [(int(mut[1:-1]) - msa_start - 1, mut[-1]) for mut in muts]
-                n_mut = len(muts)
-                if n_mut not in multiple_mutation_dict:
-                    multiple_mutation_dict[n_mut] = []
-                    gt_mut_lanscape_multiple_dict[n_mut] = []
-                multiple_mutation_dict[n_mut].append(muts)
-                gt_mut_lanscape_multiple_dict[n_mut].append(float(row["DMS_score"]))
-                for mut in muts:
-                    mutated_pos.add(mut[0])
-        keep_idx = torch.where(gt_mut_landscape_single != np.inf)
-        if f"{name}_landscape.pt" in os.listdir(save_path) and not overwrite:
-            landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-        else:
-            logits_single = None
-            landscape_single = None
-            landscape_multiple = None
-            for i in range(ensembling):
-                sample_idxs_small = sampler.get_sample_idxs(msa=msa, name=name + "_colabfold", size=msa_length,
-                                                            result_cache_dir=cache_dir)[1:]
-                small_msa = [first_seq] + [first_seq] + [msa[i] for i in sample_idxs_small]
-                landscape_single_, logits_single_ = single_mutational_landscape(model, small_msa, len(small_msa) - 1,
-                                                                                mutated_pos)
-                if i == 0:
-                    landscape_single = landscape_single_
-                    logits_single = logits_single_
-                    if not single_mutation_only:
-                        landscape_multiple_ = multiple_mutational_landscape_iid(landscape_single_,
-                                                                                multiple_mutation_dict)
-                        landscape_multiple = landscape_multiple_
-                else:
-                    landscape_single += landscape_single_
-                    logits_single += logits_single_
-                    if not single_mutation_only:
-                        landscape_multiple_ = multiple_mutational_landscape_iid(landscape_single_,
-                                                                                multiple_mutation_dict)
-                        landscape_multiple += landscape_multiple_
-            gt_mut_landscape_single_keep = gt_mut_landscape_single[keep_idx]
-            landscape_single = landscape_single[keep_idx]
-            if not single_mutation_only:
-                gt_mut_lanscape_multiple = torch.cat(
-                    [torch.tensor(gt_mut_lanscape_) for gt_mut_lanscape_ in gt_mut_lanscape_multiple_dict.values()], 0)
-                landscape = torch.cat([landscape_single, landscape_multiple], 0)
-                gt_landscape = torch.cat([gt_mut_landscape_single_keep, gt_mut_lanscape_multiple], 0)
-            else:
-                landscape = landscape_single
-                gt_landscape = gt_mut_landscape_single_keep
-            torch.save((landscape, gt_landscape), f"{save_path}/{name}_landscape.pt")
-            torch.save(logits_single, f"{save_path}/{name}_logits.pt")
-
-        sp = spearmanr(gt_landscape, landscape)[0]
-        print("Dataset:", name, "Spearman:", sp, "Single mutation only:", single_mutation_only)
-        res[name] = sp
+        mamba_config.update(
+            {"msa_start": msa_start, "msa_len": msa_len, "msa_file": msa_folder + msa_filename + ".a3m"})
+        evaluate_one_csv(csv_folder + csv_filename,
+                         f"{save_path}/{name}_landscape.csv",
+                         cache_dir,
+                         model_config,
+                         mamba_config,
+                         retrieval_config,
+                         device=device)
     torch.save(res, f"{save_path}/spearman.pt")
 
 
-def spearmans(save_path, validation_only=False):
+def add_other_model(database_df, folder_list, out_folder, column_name_list, weights=None):
+    # if weights are not provided, use Linear Regression on val names to combine the landscapes:
+    folder_gt = "/data2/malbrank/protein_gym/substitutions/zero_shot_substitutions_scores/Ground_truth/"
+    res_csv = [{x["DMS_id"]: pd.read_csv(folder_list[k] + x["DMS_filename"])[column_name_list[k]].values for i, x in
+                database_df.iterrows()} for k in range(len(folder_list))]
+
     res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
+    X = [np.array([res_csv[i][name] for i in range(len(res_csv))]) for name in database_df["DMS_id"]]
+    X = [x.reshape(len(res_csv), -1).T for x in X]
+
+    pred = {x["DMS_id"]: (X[i] * weights).sum(1) for i, x in database_df.iterrows()}
+    if not os.path.exists(f"{out_folder}"):
+        os.mkdir(f"{out_folder}")
+    for i, row in database_df.iterrows():
         name = row["DMS_id"]
-        if validation_only and name not in val_names:
-            continue
-        if f"{name}_landscape.pt" in os.listdir(save_path):
-            try:
-                landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-            except:
-                print("error: ", name)
-                continue
-        else:
-            continue
-        sp = spearmanr(gt_landscape, landscape)[0]
+        p = pred[name]
+        csv_df = pd.read_csv(folder_gt + row["DMS_filename"])
+        df = pd.DataFrame({"mutant": csv_df["mutant"].values, "combined": p, "DMS_score": csv_df["DMS_score"].values})
+        df.to_csv(f"{out_folder}/{name}.csv", index=False)
+        sp = spearmanr(p, df["DMS_score"])[0]
         print("Dataset:", name, "Spearman:", sp)
         res[name] = sp
-    torch.save(res, f"{save_path}/spearman.pt")
-
-
-def spearmanrs_by_depth(csv_folder, save_path):
-    if not os.path.exists(f"{save_path}"):
-        os.mkdir(f"{save_path}")
-
-    csv_files = os.listdir(csv_folder)
-    csv_files = [f for f in csv_files if f.endswith(".csv")]
-    csv_files_to_prot = {}
-    for filename in csv_files:
-        prot = "_".join(filename.split("_")[:2])
-        csv_files_to_prot[filename] = prot
-
-    res = {}
-    counter = 0
-    all_spearmanrs_by_depth = {}
-    for i, row in list(database_df.iterrows())[::-1]:
-
-        name = row["DMS_id"]
-
-        csv_filename = row["DMS_filename"]
-        df = pd.read_csv(csv_folder + csv_filename)
-        mutations_depth_count = [0, 0, 0, 0, 0, 0]
-        for i, row in df.iterrows():
-            muts = row["mutant"].split(":")
-            n_muts = min(len(muts), 5)
-            mutations_depth_count[n_muts] += 1
-        cumsums = np.cumsum(mutations_depth_count)
-        landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-        spearmanrs_by_depth = []
-        for i in range(5):
-            if mutations_depth_count[i + 1] > 0:
-                spearmanrs_by_depth.append(
-                    spearmanr(gt_landscape[cumsums[i]:cumsums[i + 1]], landscape[cumsums[i]:cumsums[i + 1]])[0])
-            else:
-                spearmanrs_by_depth.append(None)
-
-        spearmanrs_by_depth.append(spearmanr(gt_landscape[cumsums[1], :], landscape[cumsums[1], :])[0])
-        all_spearmanrs_by_depth[name] = spearmanrs_by_depth
-    torch.save(all_spearmanrs_by_depth, f"{save_path}/all_spearmanrs_by_depth.pt")
-
-
-def auc(save_path, validation_only=False):
-    res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
-        name = row["DMS_id"]
-        cutoff = row["DMS_binarization_cutoff"]
-
-        if validation_only and name not in val_names:
-            continue
-        if f"{name}_landscape.pt" in os.listdir(save_path):
-            try:
-                landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-            except:
-                print("error: ", name)
-                continue
-        else:
-            continue
-        try:
-            auc = roc_auc_score(gt_landscape > cutoff, landscape)
-        except:
-            auc = 0.5
-        print("Dataset:", name, "AUC:", auc)
-        res[name] = auc
-    torch.save(res, f"{save_path}/auc.pt")
-
-
-def mcc(save_path, validation_only=False):
-    # compute mattews correlation coefficient sklearn.metrics.matthews_corrcoef
-    res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
-        name = row["DMS_id"]
-        cutoff = row["DMS_binarization_cutoff"]
-
-        if validation_only and name not in val_names:
-            continue
-        if f"{name}_landscape.pt" in os.listdir(save_path):
-            try:
-                landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-            except:
-                print("error: ", name)
-                continue
-        else:
-            continue
-        try:
-            mcc = matthews_corrcoef(gt_landscape > cutoff, landscape)
-        except:
-            mcc = 0
-        print("Dataset:", name, "MCC:", mcc)
-        res[name] = mcc
-    torch.save(res, f"{save_path}/mcc.pt")
-
-
-def top10percentrecall(save_path, validation_only=False):
-    res = {}
-    for i, row in list(database_df.iterrows())[::-1]:
-        name = row["DMS_id"]
-        cutoff = row["DMS_binarization_cutoff"]
-        if validation_only and name not in val_names:
-            continue
-        if f"{name}_landscape.pt" in os.listdir(save_path):
-            try:
-                landscape, gt_landscape = torch.load(f"{save_path}/{name}_landscape.pt")
-            except:
-                print("error: ", name)
-                continue
-        else:
-            continue
-        top_true = (gt_landscape >= np.percentile(gt_landscape, 90))
-        top_model = (landscape >= np.percentile(landscape, 90))
-
-        TP = (top_true) & (top_model)
-        recall = TP.sum() / (top_true.sum())
-        recall = recall.item()
-        print("Dataset:", name, "Top 10% Recall:", recall)
-        res[name] = recall
-    torch.save(res, f"{save_path}/top10percentrecall.pt")
-
-
-def grid_search(checkpoints, csv_folder, msa_folder, out_folder, database_df, cache_dir):
-    r""" Grid search across different hyperparameters
-
-    Args:
-        csv_folder (str): path to the csv folder
-        msa_folder (str): path to the msa folder
-        out_folder (str): path to the output folder
-        database_df (pd.DataFrame): dataframe containing the database
-        cache_dir (str): path to the cache directory
-    """
-    # grid search across:
-    dissimalirities = [.7]
-    similarities = [.98]
-    shuffle = [True]
-    possible_n_tokens = [200]
-    ensembling = [3]
-
-    for (preprefix, checkpoint), n_tokens, do_shuffle, max_similarity, max_dissimilarity, n_ensemble in product(
-            checkpoints, possible_n_tokens, shuffle, similarities, dissimalirities, ensembling):
-        prefix = f"{preprefix}_colabfold_msa_poetsampling_maxsim{int(max_similarity * 100)}"
-        evaluate_all_landscapes(checkpoint,
-                                prefix,
-                                None,
-                                csv_folder,
-                                msa_folder,
-                                out_folder,
-                                database_df,
-                                cache_dir,
-                                overwrite=False,
-                                validation_only=False,
-                                max_similarity=max_similarity,
-                                max_dissimilarity=max_dissimilarity,
-                                max_msa_length=n_tokens,
-                                ensembling=n_ensemble)
+    torch.save(res, f"{out_folder}/spearman.pt")
 
 
 if __name__ == "__main__":
     data_dir = "/data2/malbrank/protein_gym"
-    csv_folder = f"{data_dir}/substitutions/DMS_ProteinGym_substitutions/"
-    out_folder = f"{data_dir}/protein_gym/mut_effects_test/"
+
+    model_config = {"checkpoint": "/nvme1/common/mamba_100M_FIM-finetuned_131k_checkpoint-3200",
+                    "model_class": MambaLMHeadModelwithPosids,
+                    "checkpoint_mixer": False
+                    }
+
+    mamba_config = {"n_tokens": None,
+                    "max_msa_length": 200,
+                    "overwrite": True,
+                    "max_similarity": 0.98,
+                    "max_dissimilarity": 0.7,
+                    "ensembling": 1,
+                    "mutation_landcape_fct": mutational_landscape}
+
+    msa_folder_for_retrievals = f"{data_dir}/msa_files/proteingym/"
+    retrieval_config = {"alpha": 0.5,
+                        "msa_folder": msa_folder_for_retrievals}
+
+    out_folder = f"{data_dir}/mut_effects/"
     database_df = pd.read_csv(f"{data_dir}/substitutions/DMS_substitutions.csv")
-    msa_folder_colabfold = f"{data_dir}/msa/colabfold/"
-    msa_folder_for_retrievals = f"{data_dir}/msa/proteingym/"
+    msa_folder_colabfold = f"{data_dir}/msa_files/colabfold/"
+    csv_folder = f"{data_dir}/substitutions/DMS_ProteinGym_substitutions/"
     cache_folder = f"{data_dir}/cache"
-    expe_name = "protmamba_long_finetuned"
-    checkpoints = [("new_mamba_ckpmix_ft", "/nvme1/common/mamba_100M_FIM-finetuned_131k_checkpoint-3200"), ]
+    expe_name = "protmamba1_finetuned_corrected"
 
-    # Usage evaluate_all_landscapes
-    #evaluate_all_landscapes(checkpoints[0][0], expe_name,None, csv_folder, msa_folder_colabfold, out_folder, database_df, cache_folder, overwrite=False, validation_only=False,)
-
-    # Usage for grid search
-    # grid_search(checkpoints, csv_folder, msa_folder_colabfold, out_folder, database_df, cache_folder)
+    # Usage evaluate_all_landscape
+    evaluate_all_landscapes(expe_name,
+                            csv_folder,
+                            msa_folder_colabfold,
+                            out_folder,
+                            database_df,
+                            model_config=model_config,
+                            mamba_config=mamba_config,
+                            retrieval_config=retrieval_config,
+                            validation_only=False,
+                            device="cuda:0")
 
     # Usage for retrievals
-    for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]:
-        out_folder_ = f"{out_folder}/protmamba_long_finetuned_200"
-        save_path = out_folder_ + f"_with_retrievals_proteingym_{alpha}"
-        # add_retrievals(alpha, save_path, csv_folder, msa_folder_for_retrievals, out_folder_, database_df, cache_folder, validation_only=False, msa_type="proteingym")
-
-    # usage for spearamnrs, auc, mcc, top10percentrecall, spearmanrs_by_depth
-    out_folder_ = f"{out_folder}/{expe_name}"
-    # spearmans(out_folder_, validation_only=False)
-    # auc(out_folder_, validation_only=False)
-    # mcc(out_folder_, validation_only=False)
-    # top10percentrecall(out_folder_, validation_only=False)
-    # spearmanrs_by_depth(csv_folder, out_folder_)
-
-    # Usage for ensembling
-    to_ensemble_folders = [
-        out_folder + "protmamba_long_finetuned_25",
-        out_folder + "protmamba_long_finetuned_50",
-        out_folder + "protmamba_long_finetuned_100",
-        out_folder + "protmamba_long_finetuned_200",
-        out_folder + "protmamba_long_finetuned_400",
-    ]
-    out_ensembled_folder = out_folder + "protmamba_long_finetuned_25_to_400"
-    # ensemble_landscapes(to_ensemble_folders, out_ensembled_folder, validation_only=False)
+    for alpha in [0.5]:
+        folder = "/data2/malbrank/protein_gym/mut_effects/protmamba1_finetuned_corrected_msalength_200/"
+        save_path = out_folder + f"_with_retrievals_proteingym_{alpha}"
+        add_retrievals(alpha,
+                       save_path,
+                       folder,
+                       msa_folder_for_retrievals,
+                       database_df,
+                       cache_folder,
+                       validation_only=False,
+                       )
+        # weights=np.array([[1 - alpha, alpha]]))

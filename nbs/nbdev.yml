@@ -1,9 +1,0 @@
-project:
-  output-dir: _docs
-
-website:
-  title: "ProtMamba-ssm"
-  site-url: "https://Bitbol-Lab.github.io/ProtMamba-ssm"
-  description: "Code to run ProtMamba locally"
-  repo-branch: main
-  repo-url: "https://github.com/Bitbol-Lab/ProtMamba-ssm"

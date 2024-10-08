@@ -417,12 +417,12 @@ def evaluate_one_csv(csv_file, out_file, cache_dir, model_config, mamba_config, 
         for i in range(ensembling):
             result_dict[f"predicted_score_{i}"] = landscapes[i]
     result_df = pd.DataFrame(result_dict)
-    result_df.to_csv(f"{save_path}/{name}.csv", index=False)
+    result_df.to_csv(f"{out_file}/{name}.csv", index=False)
     if retrieval_config is not None:
         alpha = retrieval_config.get("alpha", 0.5)
         msa_folder = retrieval_config.get("msa_folder", "")
         add_retrievals(alpha=alpha,
-                       save_path=f"{save_path}_with_retrievals",
+                       save_path="/".join(out_file.split("/")[:-1])+f"_retrieval_{alpha}/",
                        csv_folder=csv_folder,
                        msa_folder=msa_folder,
                        database_df=database_df,
@@ -487,7 +487,7 @@ def evaluate_all_landscapes(prefix,
         mamba_config.update(
             {"msa_start": msa_start, "msa_len": msa_len, "msa_file": msa_folder + msa_filename + ".a3m"})
         evaluate_one_csv(csv_folder + csv_filename,
-                         f"{save_path}/{name}_landscape.csv",
+                         f"{save_path}/{name}.csv",
                          cache_dir,
                          model_config,
                          mamba_config,
@@ -572,4 +572,3 @@ if __name__ == "__main__":
                        cache_folder,
                        validation_only=False,
                        )
-        # weights=np.array([[1 - alpha, alpha]]))

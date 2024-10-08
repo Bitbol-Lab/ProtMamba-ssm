@@ -1,12 +1,12 @@
-data_dir: "/home/malbrank/data/"
-output_dir: "/home/mabrank/scripts/results/"
+data_dir: "/home/user/data/" #"/home/malbrank/nas/protmamba2/data/" and "/nvme1/common/OpenProteinSet/"
+output_dir: "/home/user/results/"
 namedir: "test0"
 train_dataset_path: "encoded_MSAs_subset-100.pkl"
 eval_dataset_path: '...'
-batch_size: 1 # mamba trained with total 0.5M tokens per batch
+batch_size: 2 # mamba trained with total 0.5M tokens per batch
 d_model: 1024
-gradient_accumulation_steps: 8
-checkpoint_mixer: True
+gradient_accumulation_steps: 1
+checkpoint_mixer: False
 learning_rate: 0.0006 # mamba default (x5), decrease to 0.0006 for sizes > 100M params and 0.0002 for sizes > 1B params
 weight_decay: 0.1 # mamba default
 beta1: 0.9 # mamba default
@@ -27,7 +27,7 @@ save_steps: 250
 eval_steps: 50
 size_validation: 4
 logging_steps: 10
-eval_accumulation_steps: 200
+eval_accumulation_steps: 10
 save_total_limit: 50
 dtype: "bfloat16"
 fim_strategy: "multiple_span" #["no-scramble", "one_span", "multiple_span"]

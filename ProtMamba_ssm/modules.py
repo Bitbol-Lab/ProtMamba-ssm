@@ -710,10 +710,11 @@ class MambaLMHeadModelwithPosids(nn.Module, GenerationMixinSafe):
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
-        CausalLMOutput = namedtuple("CausalLMOutput", ["loss", "logits", "hidden_states"])
         if len(save_layer) > 0:
+            CausalLMOutput = namedtuple("CausalLMOutput", ["loss", "logits", "hidden_states"])
             return CausalLMOutput(loss=None, logits=lm_logits, hidden_states=hidden_states)
-        return CausalLMOutput(loss=None, logits=lm_logits, hidden_states=None)
+        CausalLMOutput = namedtuple("CausalLMOutput", ["loss", "logits"])
+        return CausalLMOutput(loss=None, logits=lm_logits)
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, checkpoint_mixer=False, **kwargs):

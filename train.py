@@ -170,7 +170,8 @@ def run(config, namedir=None, finetune_model_path=None, restart_optimizer_and_sc
             overwrite_output_dir=False,
             push_to_hub=False,
             label_names=["labels"],
-        ),
+
+            ),
         compute_only_fim_loss=config["compute_only_fim_loss"],
         data_collator=data_collator,
         compute_metrics=compute_metrics,
@@ -204,7 +205,9 @@ if __name__ == "__main__":
         print(f"Using gpu {use_one_gpu}")
     print("Number of gpus used: ", torch.cuda.device_count())
 
-    with open("configs/default_config.yaml", "r") as file:
+
+
+    with open("/home/user/scripts/configs/default_config.yaml", "r") as file:
         defaultconfig = yaml.safe_load(file)
 
     namedir = "test"

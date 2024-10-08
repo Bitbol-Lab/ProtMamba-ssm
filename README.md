@@ -45,7 +45,7 @@ regions of sequences, and predicting the fitness of protein variants.
 
 `configs/`: Configuration files for model training and evaluation.
 
-`data/`: Example dataset. Split between training and testing used in the original training of the model
+`data/`: Example dataset and full train/test split used to train the model (list of OpenProteinSet cluster names).
 
 `nbs/`: Implementation of the ProtMamba model architecture in jupyter
 notebooks.

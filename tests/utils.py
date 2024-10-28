@@ -1,10 +1,9 @@
-
 import hashlib
 import math
 import os
 import pickle
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Union
 
 import numpy as np
 import torch
@@ -124,7 +123,7 @@ class Uniclust30_Dataset(Dataset):
         return np.concatenate([sequence[-1:], sequence[:-1]]), np.concatenate(
             [position_ids[-1:], position_ids[:-1]]) if position_ids is not None else None
 
-    def sample_sequences(self, sequences, num_sequences, shuffle=True):
+    def sample_sequences(self, sequences, num_sequences, shuffle=True, which_seqs: Union[np.array, None]=None):
         """Sample `num_sequences` from the sequences in the cluster."""
         L = len(sequences)
         # get the indexes of the start of each sequence
@@ -133,10 +132,11 @@ class Uniclust30_Dataset(Dataset):
         assert len(inds) > 0, "No sequences found in cluster."
         assert len(inds) >= num_sequences, "Not enough sequences in cluster."
         # sample n_sequences randomly from the sequences
-        if shuffle:
-            which_seqs = np.random.choice(np.arange(len(inds)), num_sequences, replace=False)
-        else:
-            which_seqs = np.arange(len(inds))[-num_sequences:]
+        if which_seqs is None:
+            if shuffle:
+                which_seqs = np.random.choice(np.arange(len(inds)), num_sequences, replace=False)
+            else:
+                which_seqs = np.arange(len(inds))[-num_sequences:]
         # get the tuples of start and end indexes of the sequences
         tuples = [(inds[i], inds[i + 1]) if i < len(inds) - 1 else (inds[i], L) for i in which_seqs]
         if self.troubleshoot:

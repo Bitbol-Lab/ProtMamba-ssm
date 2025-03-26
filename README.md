@@ -72,6 +72,16 @@ IMPORTANT: the sequences should be in `a3m` files but they do not need
 to be aligned.
 
 ``` python
+from protmamba.core import *
+from protmamba.dataloaders import *
+from protmamba.utils import *
+from protmamba.modules import *
+import torch
+from matplotlib import pyplot as plt
+import numpy as np
+```
+
+``` python
 import pickle
 msa_paths = {"name-of-msa" : "../data/example_msa.a3m"}
 # path saving directory

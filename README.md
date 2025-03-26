@@ -72,10 +72,9 @@ IMPORTANT: the sequences should be in `a3m` files but they do not need
 to be aligned.
 
 ``` python
-from protmamba.core import *
-from protmamba.dataloaders import *
-from protmamba.utils import *
-from protmamba.modules import *
+from ProtMamba_ssm.dataloaders import *
+from ProtMamba_ssm.utils import *
+from ProtMamba_ssm.modules import *
 import torch
 from matplotlib import pyplot as plt
 import numpy as np

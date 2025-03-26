@@ -75,6 +75,7 @@ to be aligned.
 from ProtMamba_ssm.dataloaders import *
 from ProtMamba_ssm.utils import *
 from ProtMamba_ssm.modules import *
+from train import run
 import torch
 from matplotlib import pyplot as plt
 import numpy as np
